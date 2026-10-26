@@ -10,12 +10,28 @@ At the prompt of a Claude Code terminal session:
 /plugin install model-router --marketplace bss130100-create/model-router
 ```
 
-From a shell (also works in a cloud environment's setup script):
+From a shell:
 
 ```
 claude plugin marketplace add bss130100-create/model-router
 claude plugin install model-router@mihai-mods
 ```
+
+### In a cloud environment's setup script (pin a release)
+
+Cloud environments cache the setup script's result for about seven days and
+rebuild it only when the script text changes. So pin a release branch: the
+script then changes with every update, which rebuilds the cache, and the last
+line fails setup loudly if the wrong version got installed.
+
+```
+set -e
+claude plugin marketplace add bss130100-create/model-router#release-0.2.1
+claude plugin install model-router@mihai-mods
+claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.2.1" || { echo "model-router: installed version is not 0.2.1" >&2; exit 1; }
+```
+
+To update: push a `release-<version>` branch, then change both `0.2.1`s in the script.
 
 ## What it does
 

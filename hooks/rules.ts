@@ -70,8 +70,9 @@ export const AUTO_TIER_CAP: ModelRouterTier = 'hard'
 // model re-reads the whole conversation at full price. Above this many tokens
 // the router never switches to a cheaper model than the one that ran last;
 // effort still follows the tier (an effort change keeps the cache). A #tag
-// still forces any tier.
-export const LONG_CONTEXT_TOKENS = 100_000
+// still forces any tier. 50K: a Projects thread is past it from its first
+// prompt (~77K), so there the model only ever moves up after the first turn.
+export const LONG_CONTEXT_TOKENS = 50_000
 
 // If the classifier fails (timeout, API error, unreadable answer) this tier is
 // used and the status line says so. Your prompt is never blocked by the router.

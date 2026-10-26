@@ -12,6 +12,7 @@ import {
   parseClassifierReply,
   prepareClassifierInput,
   routeNote,
+  rowText,
   unwrap,
   validateConfig,
 } from '../hooks/route'
@@ -108,7 +109,7 @@ test('describeRouter lists every tier and the classifier', async () => {
   expect(text).toContain('trivial -> haiku · low')
   expect(text).toContain('max -> opus · max')
   expect(text).toContain('Classifier: haiku · low')
-  expect(text).toContain('Above 100K tokens of context it never switches to a cheaper model')
+  expect(text).toContain('Above 50K tokens of context it never switches to a cheaper model')
 })
 
 // A Projects relay as it arrives, preamble included: the preamble names the
@@ -248,6 +249,33 @@ describe('prepareClassifierInput', () => {
 
   test('n = 0 reads no context', async () => {
     expect(prepareClassifierInput('hi', rows, 0)).toEqual({ prompt: 'hi', context: [] })
+  })
+
+  test("reads Claude's replies sent through a reply tool, and no other tool's input", async () => {
+    const thread = [
+      {
+        role: 'assistant' as const,
+        text: '',
+        toolUses: [
+          { tool: 'Bash', input: { command: 'git push' } },
+          { tool: 'mcp__hearthbot__post_message', input: { text: 'Create the repo, then tell me and I will push.' } },
+        ],
+      },
+      { role: 'user' as const, text: '' },
+    ]
+    expect(prepareClassifierInput("it's live", thread, 6).context).toEqual([
+      { role: 'assistant', text: 'Create the repo, then tell me and I will push.' },
+    ])
+  })
+})
+
+describe('rowText', () => {
+  test('a plain row is its text', async () => {
+    expect(rowText({ role: 'assistant', text: 'Done.' })).toBe('Done.')
+  })
+
+  test('a reply tool call without text adds nothing', async () => {
+    expect(rowText({ role: 'assistant', text: '', toolUses: [{ tool: 'mcp__x__post_message', input: {} }] })).toBe('')
   })
 })
 

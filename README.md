@@ -1,6 +1,6 @@
 # model-router
 
-A Claude Code mod that picks the **model** and **effort level** for each prompt you send, from simple keyword rules you edit yourself.
+A Claude Code mod that picks the **model** and **effort level** for each prompt you send. A small, fast classifier model (Haiku) reads each prompt and picks a tier; you tune the tiers in one file.
 
 ## Install
 
@@ -68,13 +68,14 @@ to force a tier. A tag skips the classifier. Only tags in your own words count: 
 **Long conversations.** Each model keeps its own prompt cache, so moving to a
 cheaper model in a long conversation re-reads everything at full price and costs
 more than it saves. An effort change keeps the cache. So above
-`LONG_CONTEXT_TOKENS` (100K) the router never switches to a cheaper model than the
+`LONG_CONTEXT_TOKENS` (50K) the router never switches to a cheaper model than the
 one that ran last, while the effort still follows the new tier: a "thanks" after
 hard work runs on Opus at low effort, not on Haiku. A #tag still forces any tier.
 
 **Projects threads.** Messages there arrive wrapped in XML; the router reads only
-your words (plus a colleague's note) and drops rows that are only tool calls
-before taking the last 6 messages as context. Background-task notifications and system
+your words (plus a colleague's note) and Claude's replies (sent through its reply
+tool), and drops rows that are only tool calls before taking the last 6 messages
+as context. Background-task notifications and system
 events (a wake with no words from you and no note) keep the last pick instead of
 being routed again. A message that arrives while a turn runs is routed for the
 next turn; the running turn keeps its route.
@@ -110,13 +111,22 @@ everywhere, including Projects threads where slash commands cannot run.
 - While it is on, the router overrides the model you picked with `/model`.
 - Each prompt costs one small Haiku call (about a second). Slash commands skip it.
 - Switching model between turns re-reads the conversation without the prompt
-  cache, so a switch costs a little more on that turn.
-- Haiku and Sonnet may have a smaller context window than your session model.
-  In a very long conversation, force a tier with `#standard` or turn routing off.
-- A model that does not take an effort setting (for example `haiku`) is sent none.
+  cache, so a switch costs more on that turn. That is why, past
+  `LONG_CONTEXT_TOKENS`, the router never switches to a cheaper model.
 
 ## Tests
 
 ```
 claude plugin test .
+```
+
+## Eval
+
+`eval/` scores the classifier against real prompts whose right tier was decided
+before any run, both with context and as a Projects thread delivers them. The
+prompts are private conversation data, so they are not in this repo;
+`eval/sample-cases.json` shows the format. See `eval/README.md`.
+
+```
+python3 eval/run_eval.py --cases <your-cases.json>
 ```

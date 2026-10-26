@@ -180,22 +180,41 @@ function cut(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)} [...cut]`
 }
 
+/** A session row as the router reads it: its text, and the tool calls it made. */
+export type SessionRow = {
+  role: 'user' | 'assistant'
+  text: string
+  toolUses?: readonly { tool: string; input: Record<string, unknown> }[]
+}
+
+/**
+ * What a row says. In a Projects thread Claude answers the person through a
+ * reply tool (a name ending in post_message), so its words are that call's
+ * `text` input and the row's own text is empty.
+ */
+export function rowText(row: SessionRow): string {
+  const replies = (row.toolUses ?? [])
+    .filter(u => u.tool.endsWith('post_message') && typeof u.input.text === 'string')
+    .map(u => u.input.text as string)
+  return [row.text, ...replies].filter(t => t.trim() !== '').join('\n')
+}
+
 /**
  * What the classifier reads, from the raw prompt and the raw session rows:
- * the prompt and every row are unwrapped (extractRequest), then rows left
- * with no text (tool calls, tool results, system events) are dropped BEFORE
- * the last `n` are taken.
+ * the prompt and every row are unwrapped (rowText, then extractRequest), then
+ * rows left with no text (tool calls, tool results, system events) are
+ * dropped BEFORE the last `n` are taken.
  */
 export function prepareClassifierInput(
   prompt: string,
-  rows: readonly ContextMessage[],
+  rows: readonly SessionRow[],
   n: number,
 ): { prompt: string; context: ContextMessage[] } {
   const context =
     n === 0
       ? []
       : rows
-          .map(r => ({ role: r.role, text: extractRequest(r.text) }))
+          .map(r => ({ role: r.role, text: extractRequest(rowText(r)) }))
           .filter(r => r.text.trim() !== '')
           .slice(-n)
   return { prompt: extractRequest(prompt), context }

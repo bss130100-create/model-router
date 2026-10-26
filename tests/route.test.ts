@@ -1,11 +1,17 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { CLASSIFIER, ON_CLASSIFIER_ERROR, TIERS } from '../hooks/rules'
+import { AUTO_TIER_CAP, CLASSIFIER, LONG_CONTEXT_TOKENS, ON_CLASSIFIER_ERROR, TIERS } from '../hooks/rules'
 import {
   buildClassifierRequest,
+  capAutoTier,
+  decide,
   describeRouter,
+  extractRequest,
   findTag,
+  keepHigherInLongContext,
   parseClassifierReply,
+  prepareClassifierInput,
+  routeNote,
   validateConfig,
 } from '../hooks/route'
 
@@ -54,14 +60,10 @@ describe('buildClassifierRequest', () => {
   test('carries the recent conversation and the new request', async () => {
     const { prompt } = buildClassifierRequest(
       'yes, do it',
-      [
-        { role: 'assistant', text: 'Plan: rewrite the scanner in 4 files.' },
-        { role: 'user', text: '' },
-      ],
+      [{ role: 'assistant', text: 'Plan: rewrite the scanner in 4 files.' }],
       TIERS,
     )
     expect(prompt).toContain('ASSISTANT: Plan: rewrite the scanner in 4 files.')
-    expect(prompt).not.toContain('USER: \n')
     expect(prompt).toContain('<new_request>\nyes, do it\n</new_request>')
   })
   test('cuts a huge prompt', async () => {
@@ -73,36 +75,160 @@ describe('buildClassifierRequest', () => {
 
 describe('validateConfig', () => {
   test('the shipped rules are valid', async () => {
-    validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR)
+    validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)
   })
   test('an unknown effort is refused', async () => {
     const bad = { ...TIERS, hard: { ...TIERS.hard, effort: 'ultra' as never } }
-    expect(() => validateConfig(bad, CLASSIFIER, ON_CLASSIFIER_ERROR)).toThrow(/effort "ultra"/)
+    expect(() => validateConfig(bad, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(/effort "ultra"/)
   })
   test('a missing tier is refused', async () => {
     const { max: _, ...rest } = TIERS
-    expect(() => validateConfig(rest as typeof TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR)).toThrow(
+    expect(() => validateConfig(rest as typeof TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(
       /missing "max"/,
     )
   })
   test('an empty guide is refused', async () => {
     const bad = { ...TIERS, simple: { ...TIERS.simple, guide: ' ' } }
-    expect(() => validateConfig(bad, CLASSIFIER, ON_CLASSIFIER_ERROR)).toThrow(/empty guide/)
+    expect(() => validateConfig(bad, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(/empty guide/)
   })
   test('a bad timeout is refused', async () => {
-    expect(() => validateConfig(TIERS, { ...CLASSIFIER, timeoutMs: 0 }, ON_CLASSIFIER_ERROR)).toThrow(
+    expect(() => validateConfig(TIERS, { ...CLASSIFIER, timeoutMs: 0 }, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(
       /timeoutMs/,
     )
   })
   test('an error tier that does not exist is refused', async () => {
-    expect(() => validateConfig(TIERS, CLASSIFIER, 'medium' as never)).toThrow(/not a tier/)
+    expect(() => validateConfig(TIERS, CLASSIFIER, 'medium' as never, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(/not a tier/)
   })
 })
 
 test('describeRouter lists every tier and the classifier', async () => {
-  const text = describeRouter(false, null, TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR)
+  const text = describeRouter(false, null, TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)
   expect(text).toContain('Model router is ON')
   expect(text).toContain('trivial -> haiku · low')
   expect(text).toContain('max -> opus · max')
   expect(text).toContain('Classifier: haiku · low')
+  expect(text).toContain('Above 100K tokens of context it only moves up a tier')
+})
+
+describe('extractRequest', () => {
+  test('a plain prompt is returned as it is', async () => {
+    expect(extractRequest('fix <b>this</b> bug')).toBe('fix <b>this</b> bug')
+  })
+
+  test("a thread wake is unwrapped to the person's words", async () => {
+    const wake = [
+      '<wake reason="mention" current-time="2026-10-26T17:12:18Z">',
+      '  <project id="chan_1" type="project"><thread ts="cmsg_A">',
+      '    <message trigger="true" from="human" trust="principal" author="Mihai" id="cmsg_C">it&#39;s live</message>',
+      '  </thread></project>',
+      '  <system-note>If answering this message needs tool calls first...</system-note>',
+      '</wake>',
+    ].join('\n')
+    expect(extractRequest(wake)).toBe("it's live")
+  })
+
+  test('a relay keeps the cited words and the note', async () => {
+    const relay = [
+      '<coordinator-relay><relay from="coordinator" session="s1">',
+      '  <cited author="user" name="Mihai">build the HUD export</cited>',
+      '  <note>He wants CSV and PDF.</note>',
+      '</relay></coordinator-relay>',
+    ].join('\n')
+    expect(extractRequest(relay)).toBe('build the HUD export\n(note from a colleague: He wants CSV and PDF.)')
+  })
+
+  test('a wrapper with no text says so', async () => {
+    expect(extractRequest('<wake reason="mention"><message from="human" has-files="true"></message></wake>')).toBe(
+      '(a message with attachments only, no text)',
+    )
+  })
+})
+
+describe('keepHigherInLongContext', () => {
+  const hard = decide('hard', 'classifier', 'bug', TIERS)
+  const simple = decide('simple', 'classifier', 'question', TIERS)
+
+  test('a short conversation follows the new pick', async () => {
+    expect(keepHigherInLongContext(simple, hard, 50_000, 100_000)).toBe(simple)
+  })
+
+  test('a long conversation never moves down', async () => {
+    expect(keepHigherInLongContext(simple, hard, 150_000, 100_000)).toEqual({
+      ...hard,
+      source: 'long-context',
+      why: 'kept hard over simple, context 150K tokens',
+    })
+  })
+
+  test('a long conversation still moves up', async () => {
+    expect(keepHigherInLongContext(hard, simple, 150_000, 100_000)).toBe(hard)
+  })
+
+  test('with no earlier pick the new one stands', async () => {
+    expect(keepHigherInLongContext(simple, null, 150_000, 100_000)).toBe(simple)
+  })
+})
+
+test('a bad LONG_CONTEXT_TOKENS is refused', async () => {
+  expect(() => validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, 0, AUTO_TIER_CAP)).toThrow(/LONG_CONTEXT_TOKENS/)
+})
+
+describe('prepareClassifierInput', () => {
+  const rows = [
+    { role: 'user' as const, text: 'old question' },
+    { role: 'user' as const, text: '<wake reason="mention"><message from="human">plan the HUD rewrite</message></wake>' },
+    { role: 'assistant' as const, text: 'Plan: 4 files.' },
+    ...Array.from({ length: 8 }, () => ({ role: 'assistant' as const, text: '' })),
+  ]
+
+  test('drops tool rows before taking the last n, and unwraps every row', async () => {
+    expect(prepareClassifierInput('<wake><message from="human">yes</message></wake>', rows, 2)).toEqual({
+      prompt: 'yes',
+      context: [
+        { role: 'user', text: 'plan the HUD rewrite' },
+        { role: 'assistant', text: 'Plan: 4 files.' },
+      ],
+    })
+  })
+
+  test('n = 0 reads no context', async () => {
+    expect(prepareClassifierInput('hi', rows, 0)).toEqual({ prompt: 'hi', context: [] })
+  })
+})
+
+describe('capAutoTier', () => {
+  test('a pick at or below the cap stands', async () => {
+    const hard = decide('hard', 'classifier', 'bug', TIERS)
+    expect(capAutoTier(hard, 'hard', TIERS)).toBe(hard)
+  })
+
+  test('max drops to hard and is kept as a recommendation', async () => {
+    expect(capAutoTier(decide('max', 'classifier', 'stuck', TIERS), 'hard', TIERS)).toEqual({
+      tier: 'hard',
+      source: 'classifier',
+      why: 'stuck',
+      model: 'opus',
+      effort: 'xhigh',
+      recommended: 'max',
+    })
+  })
+})
+
+describe('routeNote', () => {
+  test('a recommendation tells Claude to say it in the reply', async () => {
+    const d = capAutoTier(decide('max', 'classifier', 'stuck', TIERS), 'hard', TIERS)
+    expect(routeNote(d)).toContain(
+      'Start your reply with this one line: "The router recommends max for this; reply #max to use it."',
+    )
+  })
+
+  test('no recommendation: mention the route only when asked', async () => {
+    expect(routeNote(decide('simple', 'classifier', 'q', TIERS))).toContain('Mention it only if the user asks')
+  })
+})
+
+test('an AUTO_TIER_CAP that is not a tier is refused', async () => {
+  expect(() => validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, 'huge' as never)).toThrow(
+    /AUTO_TIER_CAP/,
+  )
 })

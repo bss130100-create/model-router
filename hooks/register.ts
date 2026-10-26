@@ -1,15 +1,18 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, TurnStepInput } from 'claude-code'
 
 import type { ModelRouterDecision, ModelRouterTurnLock } from '../types'
-import { CLASSIFIER, ON_CLASSIFIER_ERROR, TIERS } from './rules'
+import { AUTO_TIER_CAP, CLASSIFIER, LONG_CONTEXT_TOKENS, ON_CLASSIFIER_ERROR, TIERS } from './rules'
 import {
   buildClassifierRequest,
+  capAutoTier,
   decide,
   describeRouter,
   findTag,
+  keepHigherInLongContext,
   label,
   parseClassifierReply,
+  prepareClassifierInput,
   routeNote,
   validateConfig,
 } from './route'
@@ -17,17 +20,19 @@ import {
 // Change a shape tag when that value's fields change: it declines what an
 // earlier version stored, which outlives a reload.
 const last = atom({ plugin: 'model-router', key: 'last' } as const, null as ModelRouterDecision | null, {
-  shape: 'decision-2',
+  shape: 'decision-3',
 })
 const lock = atom({ plugin: 'model-router', key: 'lock' } as const, null as ModelRouterTurnLock | null, {
-  shape: 'lock-2',
+  shape: 'lock-3',
 })
 const isOff = atom({ plugin: 'model-router', key: 'isOff' } as const, false)
+const contextTokens = atom({ plugin: 'model-router', key: 'contextTokens' } as const, 0)
 
 /** Asks the classifier model which tier the prompt needs. */
 async function classify($: EngineInterface, text: string): Promise<ModelRouterDecision> {
-  const history = CLASSIFIER.contextMessages === 0 ? [] : (await $.session.messages()).slice(-CLASSIFIER.contextMessages)
-  const ask = buildClassifierRequest(text, history, TIERS)
+  const rows = CLASSIFIER.contextMessages === 0 ? [] : await $.session.messages()
+  const input = prepareClassifierInput(text, rows, CLASSIFIER.contextMessages)
+  const ask = buildClassifierRequest(input.prompt, input.context, TIERS)
   const reply = await $.model.complete({
     model: CLASSIFIER.model,
     effort: CLASSIFIER.effort,
@@ -53,9 +58,26 @@ function failed($: EngineInterface, why: string): ModelRouterDecision {
   return decide(ON_CLASSIFIER_ERROR, 'error', why, TIERS)
 }
 
+/** The step with the turn's locked route applied, or as it came when there is none. */
+async function routeStep($: EngineInterface, e: TurnStepInput): Promise<TurnStepInput> {
+  if (await read($, isOff)) {
+    return e
+  }
+  let locked = await read($, lock)
+  if (locked === null || locked.turnId !== e.turnId) {
+    const decision = await read($, last)
+    if (decision === null) {
+      return e
+    }
+    locked = { turnId: e.turnId, decision }
+    await update($, lock, () => locked)
+  }
+  return { ...e, model: locked.decision.model, effort: locked.decision.effort }
+}
+
 export const register: Register = on => {
   // Fail fast: a broken rules.ts stops the mod from loading, with the reason.
-  validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR)
+  validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -66,13 +88,25 @@ export const register: Register = on => {
   })
 
   // 1. Understand each prompt you send and pick a tier.
-  // Slash commands keep the last pick.
+  // Slash commands and background-task notifications keep the last pick.
   on('prompt.submit', async ($, e, next) => {
-    if (e.command !== undefined || (await read($, isOff))) {
+    if (e.command !== undefined || e.origin.kind === 'task-notification' || (await read($, isOff))) {
       return next(e)
     }
     const tag = findTag(e.text)
-    const decision = tag === null ? await classify($, e.text) : decide(tag, 'tag', `#${tag} tag`, TIERS)
+    const decision =
+      tag === null
+        ? capAutoTier(
+            keepHigherInLongContext(
+              await classify($, e.text),
+              await read($, last),
+              await read($, contextTokens),
+              LONG_CONTEXT_TOKENS,
+            ),
+            AUTO_TIER_CAP,
+            TIERS,
+          )
+        : decide(tag, 'tag', `#${tag} tag`, TIERS)
     await update($, last, () => decision)
     $.ui.status(label(decision))
     // Tell the answering model its route, so in any session (Projects threads
@@ -89,20 +123,18 @@ export const register: Register = on => {
   // The route is locked at the turn's first request, so a message typed
   // mid-turn changes the next turn, never the one running.
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId !== undefined || (await read($, isOff))) {
+    if (e.agentId !== undefined) {
       return yield* next(e)
     }
-    let locked = await read($, lock)
-    if (locked === null || locked.turnId !== e.turnId) {
-      const decision = await read($, last)
-      if (decision === null) {
-        return yield* next(e)
-      }
-      locked = { turnId: e.turnId, decision }
-      await update($, lock, () => locked)
+    const routed = await routeStep($, e)
+    const result = yield* next(routed)
+    // 3. Remember how big the conversation is, for the long-context rule.
+    if (result.usage !== null) {
+      const u = result.usage
+      const size = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+      await update($, contextTokens, () => size)
     }
-    const { model, effort } = locked.decision
-    return yield* next({ ...e, model, effort })
+    return result
   })
 
   on('command.run', { command: 'route' }, async ($, e) => {
@@ -118,7 +150,15 @@ export const register: Register = on => {
       return { text: `Unknown option "${e.args.trim()}". Use /route, /route off or /route on.` }
     }
     return {
-      text: describeRouter(await read($, isOff), await read($, last), TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR),
+      text: describeRouter(
+        await read($, isOff),
+        await read($, last),
+        TIERS,
+        CLASSIFIER,
+        ON_CLASSIFIER_ERROR,
+        LONG_CONTEXT_TOKENS,
+        AUTO_TIER_CAP,
+      ),
     }
   })
 }

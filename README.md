@@ -26,12 +26,12 @@ line fails setup loudly if the wrong version got installed.
 
 ```
 set -e
-claude plugin marketplace add bss130100-create/model-router#release-0.2.1
+claude plugin marketplace add bss130100-create/model-router#release-0.3.0
 claude plugin install model-router@mihai-mods
-claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.2.1" || { echo "model-router: installed version is not 0.2.1" >&2; exit 1; }
+claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.3.0" || { echo "model-router: installed version is not 0.3.0" >&2; exit 1; }
 ```
 
-To update: push a `release-<version>` branch, then change both `0.2.1`s in the script.
+To update: push a `release-<version>` branch, then change both `0.3.0`s in the script.
 
 ## What it does
 
@@ -56,13 +56,29 @@ one: accuracy first, then cost. Subagents are left alone.
 | hard | opus · xhigh | hard bugs, tricky design, multi-file refactor |
 | max | opus · max | stuck after several tries, deep root-cause hunt |
 
+**Max only on request.** The router picks up to `hard` on its own
+(`AUTO_TIER_CAP`). When the classifier says `max`, the turn runs at `hard` and
+Claude starts its reply with: "The router recommends max for this; reply #max
+to use it."
+
 Type `#trivial`, `#simple`, `#standard`, `#hard` or `#max` anywhere in a prompt
 to force a tier. A tag skips the classifier.
+
+**Long conversations.** Each model keeps its own prompt cache, so moving to a
+cheaper model in a long conversation re-reads everything at full price and costs
+more than it saves. Above `LONG_CONTEXT_TOKENS` (100K) the router only moves up a
+tier, never down. A #tag still forces any tier.
+
+**Projects threads.** Messages there arrive wrapped in XML; the router reads only
+your words (plus a colleague's note) and drops rows that are only tool calls
+before taking the last 6 messages as context. Background-task notifications keep
+the last pick instead of being routed again.
 
 ## Tuning it
 
 Everything lives in `hooks/rules.ts`: each tier's model, effort, and the plain
-English guide the classifier reads to recognise it. Change a guide to move a kind
+English guide the classifier reads to recognise it, plus `AUTO_TIER_CAP` and
+`LONG_CONTEXT_TOKENS`. Change a guide to move a kind
 of request up or down a tier.
 
 If the classifier fails (timeout, API error, an answer it cannot read), the

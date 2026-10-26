@@ -25,7 +25,7 @@ export const TIERS: Record<ModelRouterTier, ModelRouterTierSpec> = {
     model: 'haiku',
     effort: 'low',
     guide:
-      'Chit-chat, thanks, a plain yes/no, or a status question. Nothing to explain or teach, no code to write or read.',
+      'Chit-chat, thanks, a plain yes/no, or a status question, and the assistant has nothing left to do. Nothing to explain or teach, no code to write or read. NOT trivial when the message lets the assistant carry on with work it said it would do next (it promised to push, build or test once the user confirmed).',
   },
   simple: {
     model: 'sonnet',
@@ -59,6 +59,17 @@ export const CLASSIFIER: ModelRouterClassifier = {
   timeoutMs: 8000,
   contextMessages: 6,
 }
+
+// The highest tier the router picks on its own. When the classifier says a
+// higher tier (max), the router runs this one instead and Claude tells you in
+// its reply that it recommends max: type #max to run it. Max only on request.
+export const AUTO_TIER_CAP: ModelRouterTier = 'hard'
+
+// In a long conversation, switching to a cheaper model costs MORE than it
+// saves: each model keeps its own prompt cache, so the first turn on the new
+// model re-reads the whole conversation at full price. Above this many tokens
+// the router only moves UP a tier, never down. A #tag still forces any tier.
+export const LONG_CONTEXT_TOKENS = 100_000
 
 // If the classifier fails (timeout, API error, unreadable answer) this tier is
 // used and the status line says so. Your prompt is never blocked by the router.

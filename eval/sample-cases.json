@@ -1,0 +1,29 @@
+[
+ {
+  "id": "S1",
+  "where": "netscan",
+  "text": "thanks, that works",
+  "ideal": "trivial",
+  "ok": ["trivial", "simple"],
+  "delivery": "wake",
+  "context": [
+   {"role": "user", "text": "make the window bigger"},
+   {"role": "assistant", "text": "Done: the window now opens at 1600x900."}
+  ],
+  "thread_prompt": "<wake reason=\"mention\" current-time=\"2026-10-25T11:15:00Z\">\n  <project id=\"chan_x\" name=\"Example\" type=\"project\">\n    <thread ts=\"cmsg_root\">\n      <message trigger=\"true\" from=\"human\" trust=\"principal\" author=\"Sam\" id=\"cmsg_x\" mention=\"true\">thanks, that works</message>\n    </thread>\n  </project>\n</wake>\n",
+  "thread_rows": [
+   {"role": "user", "text": "<wake reason=\"mention\" current-time=\"2026-10-25T11:10:00Z\">\n  <project id=\"chan_x\" name=\"Example\" type=\"project\">\n    <thread ts=\"cmsg_root\">\n      <message trigger=\"true\" from=\"human\" trust=\"principal\" author=\"Sam\" id=\"cmsg_y\" mention=\"true\">make the window bigger</message>\n    </thread>\n  </project>\n</wake>\n"},
+   {"role": "assistant", "text": "", "toolUses": [{"tool": "mcp__hearthbot__post_message", "input": {"text": "Done: the window now opens at 1600x900."}}]},
+   {"role": "user", "text": ""}
+  ]
+ },
+ {
+  "id": "S2",
+  "where": "chat",
+  "text": "what is a subnet mask?",
+  "ideal": "simple",
+  "ok": ["simple", "standard"],
+  "delivery": "none",
+  "context": []
+ }
+]

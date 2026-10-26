@@ -1,0 +1,1 @@
+{ "name": "router-harness", "version": "0.1.0", "description": "Test harness: runs model-router's real classifier over a file of cases", "types": "./types/index.d.ts" }

@@ -1,0 +1,10 @@
+{
+  "name": "model-router",
+  "version": "0.1.0",
+  "description": "Picks the model and effort for each prompt from simple keyword rules you edit in hooks/rules.ts",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Mihai"
+  },
+  "license": "MIT"
+}

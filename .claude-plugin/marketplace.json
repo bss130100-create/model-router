@@ -1,0 +1,13 @@
+{
+  "name": "mihai-mods",
+  "owner": {
+    "name": "Mihai"
+  },
+  "plugins": [
+    {
+      "name": "model-router",
+      "source": "./"
+    }
+  ],
+  "description": "Mihai's Claude Code mods"
+}

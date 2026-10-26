@@ -1,7 +1,7 @@
 {
   "name": "model-router",
-  "version": "0.1.0",
-  "description": "Picks the model and effort for each prompt from simple keyword rules you edit in hooks/rules.ts",
+  "version": "0.2.0",
+  "description": "Understands each prompt with a fast classifier model and picks the model and effort for it, from Haiku to Opus max",
   "types": "./types/index.d.ts",
   "author": {
     "name": "Mihai"

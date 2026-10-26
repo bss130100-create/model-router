@@ -19,40 +19,42 @@ claude plugin install model-router@mihai-mods
 
 ## What it does
 
-1. When you send a prompt, it checks the rules in `hooks/rules.ts` top to bottom.
-   The first rule whose keyword appears in your prompt wins (case does not matter).
-   No match: the default route (`opus` at `high`).
-2. Every model request of that turn is sent with the picked model and effort.
+1. Before each prompt runs, a small fast model (Haiku, low effort) reads your
+   prompt plus the last 6 messages and picks a **tier**. Reading the context is
+   what lets it understand short replies like "yes, do it".
+2. The tier decides the model and effort for every request of that turn.
    The pick is locked for the whole turn, so a turn never switches model halfway.
    A message you type mid-turn is routed on the next turn.
-3. The status line shows the pick, for example `route: opus · xhigh (hard-bug)`.
+3. The status line shows the pick, for example `route: opus · xhigh (hard)`.
 
-Subagents are left alone: they keep the model they were started with.
+When the classifier is unsure between two tiers it is told to pick the higher
+one: accuracy first, then cost. Subagents are left alone.
 
-## Shipped rules
+## Tiers
 
-| Rule | Example keywords | Model · effort |
+| Tier | Model · effort | For |
 | --- | --- | --- |
-| tag-max | `#max` | opus · max |
-| tag-quick | `#quick` | sonnet · low |
-| hard-bug | traceback, crash, still broken, race condition, memory leak | opus · xhigh |
-| design | architecture, design the, refactor, trade-off | opus · xhigh |
-| quick | what is, explain, summarize, rename, typo | sonnet · medium |
-| default | anything else | opus · high |
+| trivial | haiku · low | thanks, yes/no, status questions |
+| simple | sonnet · medium | explain a concept, small one-file edit |
+| standard | opus · high | normal feature work with tests |
+| hard | opus · xhigh | hard bugs, tricky design, multi-file refactor |
+| max | opus · max | stuck after several tries, deep root-cause hunt |
 
-Type `#max` or `#quick` anywhere in a prompt to force a route.
+Type `#trivial`, `#simple`, `#standard`, `#hard` or `#max` anywhere in a prompt
+to force a tier. A tag skips the classifier.
 
 ## Tuning it
 
-Edit `hooks/rules.ts`. Each rule is one line of data:
+Everything lives in `hooks/rules.ts`: each tier's model, effort, and the plain
+English guide the classifier reads to recognise it. Change a guide to move a kind
+of request up or down a tier.
 
-```ts
-{ name: 'docs', model: 'sonnet', effort: 'medium', keywords: ['readme', 'docstring'] },
-```
+If the classifier fails (timeout, API error, an answer it cannot read), the
+`ON_CLASSIFIER_ERROR` tier (standard) is used, and a toast and the status line
+say so. Your prompt is never blocked by the router.
 
-Order matters: put the more specific rules first. A mistake (an unknown effort,
-an empty keyword list, two rules with the same name) stops the mod from loading,
-and Claude Code shows the reason. It never runs with half-broken rules.
+A mistake in `rules.ts` (an unknown effort, a missing tier, an empty guide) stops
+the mod from loading, and Claude Code shows the reason.
 
 ## Commands
 
@@ -63,8 +65,11 @@ and Claude Code shows the reason. It never runs with half-broken rules.
 ## Things to know
 
 - While it is on, the router overrides the model you picked with `/model`.
+- Each prompt costs one small Haiku call (about a second). Slash commands skip it.
 - Switching model between turns re-reads the conversation without the prompt
   cache, so a switch costs a little more on that turn.
+- Haiku and Sonnet may have a smaller context window than your session model.
+  In a very long conversation, force a tier with `#standard` or turn routing off.
 - A model that does not take an effort setting (for example `haiku`) is sent none.
 
 ## Tests

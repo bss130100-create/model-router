@@ -85,45 +85,84 @@ function unescape(text: string): string {
   return text.replace(/&#39;|&#34;|&quot;|&lt;|&gt;|&amp;/g, e => ENTITIES[e] ?? e)
 }
 
-function inner(text: string, tag: string): string[] {
-  const found = text.matchAll(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`, 'g'))
-  return [...found].map(m => unescape((m[1] ?? '').trim())).filter(t => t !== '')
+/**
+ * The texts of every <tag> element whose attributes include `attr`. The
+ * content may not hold another opening <tag>: a wrapper's preamble mentions
+ * the tag in prose ("Inside, <cited author="user"> entries are ..."), and
+ * that mention must not swallow the real element after it.
+ */
+function inner(text: string, tag: string, attr: RegExp): string[] {
+  const element = new RegExp(`<${tag}\\b([^>]*)>((?:(?!<${tag}\\b)[\\s\\S])*?)</${tag}>`, 'g')
+  return [...text.matchAll(element)]
+    .filter(m => attr.test(m[1] ?? ''))
+    .map(m => unescape((m[2] ?? '').trim()))
+    .filter(t => t !== '')
+}
+
+/** A prompt as the router reads it: the person's own words, and colleagues' notes. */
+export type Unwrapped = { words: string; notes: string[] }
+
+/**
+ * In a Projects thread a prompt arrives wrapped in XML: a <wake> holding
+ * <message>s, or a <relay> holding <cited> messages and a <note>. Only a
+ * message from="human" and a cited author="user" are the person's words;
+ * notes are what another Claude wrote. Everything else (ids, system notes,
+ * messages from the system) is left out. A prompt with no wrapper is all words.
+ */
+export function unwrap(text: string): Unwrapped {
+  if (!/<(wake|relay|coordinator-relay)\b/.test(text)) {
+    return { words: text, notes: [] }
+  }
+  const words = [...inner(text, 'message', /\bfrom="human"/), ...inner(text, 'cited', /\bauthor="user"/)]
+  return { words: words.join('\n'), notes: inner(text, 'note', /^/) }
 }
 
 /**
- * The person's own words. In a Projects thread a prompt arrives wrapped in
- * XML (a <wake> with <message>s, or a <relay> with <cited> messages and a
- * <note>); the wrapper's ids and system notes would mislead the classifier.
- * A prompt with no such wrapper is returned as it is.
+ * What the classifier reads as the request: the person's words, then each
+ * note marked as a colleague's. '' when there is nothing to classify (a
+ * system event, or a message with attachments only).
  */
 export function extractRequest(text: string): string {
-  if (!/<(wake|relay|coordinator-relay)\b/.test(text)) {
-    return text
-  }
-  const words = [...inner(text, 'message'), ...inner(text, 'cited')]
-  const notes = inner(text, 'note')
-  const parts = [...words, ...notes.map(n => `(note from a colleague: ${n})`)]
-  return parts.length === 0 ? '(a message with attachments only, no text)' : parts.join('\n')
+  const { words, notes } = unwrap(text)
+  const parts = [...(words.trim() === '' ? [] : [words]), ...notes.map(n => `(note from a colleague: ${n})`)]
+  return parts.join('\n')
 }
 
 /**
- * In a long conversation keep the higher of the previous and the new tier:
- * moving down there costs more (a cold cache on the cheaper model) than it saves.
+ * Models from cheapest to strongest, ranked by the first tier that uses
+ * each; -1 for a model no tier uses.
  */
-export function keepHigherInLongContext(
+function modelRank(model: string, tiers: Tiers): number {
+  return TIER_ORDER.findIndex(t => tiers[t].model === model)
+}
+
+/**
+ * In a long conversation never switch to a cheaper model: each model has its
+ * own prompt cache, so the first turn on the cheaper one re-reads the whole
+ * conversation at full price and costs more than it saves. The new pick keeps
+ * its tier, effort and recommendation; only the model stays. An effort change
+ * keeps the cache, and a stronger model is always allowed.
+ */
+export function keepStrongerModelInLongContext(
   next: ModelRouterDecision,
   previous: ModelRouterDecision | null,
   contextTokens: number,
   limit: number,
+  tiers: Tiers,
 ): ModelRouterDecision {
   if (previous === null || contextTokens <= limit) {
     return next
   }
-  if (TIER_ORDER.indexOf(next.tier) >= TIER_ORDER.indexOf(previous.tier)) {
+  if (modelRank(next.model, tiers) >= modelRank(previous.model, tiers)) {
     return next
   }
   const k = Math.round(contextTokens / 1000)
-  return { ...previous, source: 'long-context', why: `kept ${previous.tier} over ${next.tier}, context ${k}K tokens` }
+  return {
+    ...next,
+    model: previous.model,
+    source: 'long-context',
+    why: `${next.tier} on ${previous.model}, not ${next.model}: context ${k}K tokens`,
+  }
 }
 
 /**
@@ -143,19 +182,23 @@ function cut(text: string, max: number): string {
 
 /**
  * What the classifier reads, from the raw prompt and the raw session rows:
- * rows with no text (tool calls, tool results) are dropped BEFORE the last
- * `n` are taken, and the prompt and every row are unwrapped (extractRequest).
+ * the prompt and every row are unwrapped (extractRequest), then rows left
+ * with no text (tool calls, tool results, system events) are dropped BEFORE
+ * the last `n` are taken.
  */
 export function prepareClassifierInput(
   prompt: string,
   rows: readonly ContextMessage[],
   n: number,
 ): { prompt: string; context: ContextMessage[] } {
-  const withText = n === 0 ? [] : rows.filter(r => r.text.trim() !== '').slice(-n)
-  return {
-    prompt: extractRequest(prompt),
-    context: withText.map(r => ({ role: r.role, text: extractRequest(r.text) })),
-  }
+  const context =
+    n === 0
+      ? []
+      : rows
+          .map(r => ({ role: r.role, text: extractRequest(r.text) }))
+          .filter(r => r.text.trim() !== '')
+          .slice(-n)
+  return { prompt: extractRequest(prompt), context }
 }
 
 /** The system prompt and user message the classifier gets, from prepared input. */
@@ -232,10 +275,17 @@ export function label(d: ModelRouterDecision): string {
   return d.source === 'error' ? `${head} CLASSIFIER FAILED: ${d.why}` : head
 }
 
-/** The hidden note the answering model reads beside the prompt. */
-export function routeNote(d: ModelRouterDecision): string {
+/**
+ * The hidden note the answering model reads beside the prompt. A message
+ * that arrives while a turn runs is routed for the next turn: the running
+ * turn keeps the route it started with.
+ */
+export function routeNote(d: ModelRouterDecision, isMidTurn: boolean): string {
   const why = d.why === '' ? '' : `: ${d.why}`
-  const base = `[model-router] This turn runs on ${d.model} at ${d.effort} effort (tier ${d.tier}, picked by ${d.source}${why}).`
+  const pick = `${d.model} at ${d.effort} effort (tier ${d.tier}, picked by ${d.source}${why})`
+  const base = isMidTurn
+    ? `[model-router] The router picked ${pick} for this message. The turn already running keeps its route; the pick applies from the next turn.`
+    : `[model-router] This turn runs on ${pick}.`
   if (d.recommended !== null) {
     return `${base} The router recommends tier ${d.recommended} for this request, but runs it only when the user asks. Start your reply with this one line: "The router recommends ${d.recommended} for this; reply #${d.recommended} to use it."`
   }
@@ -264,7 +314,7 @@ export function describeRouter(
     `Classifier: ${classifier.model} · ${classifier.effort}, reads the last ${classifier.contextMessages} messages.`,
     `If it fails: ${onError}.`,
     `It picks up to ${autoTierCap} on its own; higher tiers only on request, with a recommendation.`,
-    `Above ${Math.round(longContextTokens / 1000)}K tokens of context it only moves up a tier, never down.`,
+    `Above ${Math.round(longContextTokens / 1000)}K tokens of context it never switches to a cheaper model; effort still follows the tier.`,
     '',
     'Edit hooks/rules.ts to change them. /route off or /route on to switch.',
   ].join('\n')

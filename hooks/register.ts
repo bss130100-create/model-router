@@ -8,12 +8,14 @@ import {
   capAutoTier,
   decide,
   describeRouter,
+  extractRequest,
   findTag,
-  keepHigherInLongContext,
+  keepStrongerModelInLongContext,
   label,
   parseClassifierReply,
   prepareClassifierInput,
   routeNote,
+  unwrap,
   validateConfig,
 } from './route'
 
@@ -52,6 +54,23 @@ async function classify($: EngineInterface, text: string): Promise<ModelRouterDe
   }
 }
 
+/**
+ * The classifier's tier with the two cost rules applied: max only on request
+ * (AUTO_TIER_CAP), and in a long conversation never a cheaper model than the
+ * route that ran last.
+ */
+async function pick($: EngineInterface, text: string): Promise<ModelRouterDecision> {
+  const capped = capAutoTier(await classify($, text), AUTO_TIER_CAP, TIERS)
+  const ran = await read($, lock)
+  return keepStrongerModelInLongContext(
+    capped,
+    ran === null ? null : ran.decision,
+    await read($, contextTokens),
+    LONG_CONTEXT_TOKENS,
+    TIERS,
+  )
+}
+
 /** The declared error tier, said out loud: never a silent fallback. */
 function failed($: EngineInterface, why: string): ModelRouterDecision {
   $.ui.toast(`model-router: classifier failed (${why}); using ${ON_CLASSIFIER_ERROR}`)
@@ -88,30 +107,27 @@ export const register: Register = on => {
   })
 
   // 1. Understand each prompt you send and pick a tier.
-  // Slash commands and background-task notifications keep the last pick.
+  // Slash commands, background-task notifications and system events (a
+  // wrapped prompt with neither the person's words nor a note) keep the last pick.
   on('prompt.submit', async ($, e, next) => {
-    if (e.command !== undefined || e.origin.kind === 'task-notification' || (await read($, isOff))) {
+    const isSkipped =
+      e.command !== undefined ||
+      e.origin.kind === 'task-notification' ||
+      extractRequest(e.text).trim() === '' ||
+      (await read($, isOff))
+    if (isSkipped) {
       return next(e)
     }
-    const tag = findTag(e.text)
-    const decision =
-      tag === null
-        ? capAutoTier(
-            keepHigherInLongContext(
-              await classify($, e.text),
-              await read($, last),
-              await read($, contextTokens),
-              LONG_CONTEXT_TOKENS,
-            ),
-            AUTO_TIER_CAP,
-            TIERS,
-          )
-        : decide(tag, 'tag', `#${tag} tag`, TIERS)
+    // Only the person's own words can force a tier: a #max that Claude wrote,
+    // relayed or quoted in a note, must not.
+    const tag = findTag(unwrap(e.text).words)
+    const decision = tag === null ? await pick($, e.text) : decide(tag, 'tag', `#${tag} tag`, TIERS)
     await update($, last, () => decision)
     $.ui.status(label(decision))
     // Tell the answering model its route, so in any session (Projects threads
     // included, where /route cannot run) you can ask "which route are you on?".
-    return next({ ...e, context: [...(e.context ?? []), routeNote(decision)] })
+    const note = routeNote(decision, e.turnId !== undefined)
+    return next({ ...e, context: [...(e.context ?? []), note] })
   }).catch(async ($, e, next) => {
     // Never reuse a stale pick: clear it, say so, and let the prompt through.
     await update($, last, () => null)

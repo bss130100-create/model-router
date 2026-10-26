@@ -68,7 +68,9 @@ export const AUTO_TIER_CAP: ModelRouterTier = 'hard'
 // In a long conversation, switching to a cheaper model costs MORE than it
 // saves: each model keeps its own prompt cache, so the first turn on the new
 // model re-reads the whole conversation at full price. Above this many tokens
-// the router only moves UP a tier, never down. A #tag still forces any tier.
+// the router never switches to a cheaper model than the one that ran last;
+// effort still follows the tier (an effort change keeps the cache). A #tag
+// still forces any tier.
 export const LONG_CONTEXT_TOKENS = 100_000
 
 // If the classifier fails (timeout, API error, unreadable answer) this tier is

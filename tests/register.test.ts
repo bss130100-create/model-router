@@ -231,7 +231,7 @@ test('a background-task notification keeps the last pick', async ($, on) => {
   expect(sent[0]?.effort).toBe('xhigh')
 })
 
-test('in a long conversation the router does not move down', async ($, on) => {
+test('in a long conversation the model stays but the effort follows the new tier', async ($, on) => {
   const { sent } = engine(on, ['{"tier":"hard","why":"bug"}', '{"tier":"trivial","why":"thanks"}'], 150_000)
   await say($, 'the app crashes')
   await step($, 't1', 0)
@@ -239,9 +239,9 @@ test('in a long conversation the router does not move down', async ($, on) => {
   await say($, 'thanks!')
   await step($, 't2', 0)
   expect(sent[1]?.model).toBe('opus')
-  expect(sent[1]?.effort).toBe('xhigh')
+  expect(sent[1]?.effort).toBe('low')
   const shown = await route($, '')
-  expect(shown.text).toContain('by long-context: kept hard over trivial, context 150K tokens')
+  expect(shown.text).toContain('by long-context: trivial on opus, not haiku: context 150K tokens')
 })
 
 test('in a long conversation a #tag still forces a lower tier', async ($, on) => {
@@ -270,13 +270,48 @@ test('#max runs max', async ($, on) => {
   expect(notes[0]).not.toContain('recommends')
 })
 
-test('after #max a long conversation keeps opus but does not stay on max by itself', async ($, on) => {
+test('after #max a long conversation keeps opus but does not stay on max', async ($, on) => {
   const { sent, notes } = engine(on, '{"tier":"simple","why":"q"}', 150_000)
   await say($, 'go deep #max')
   await step($, 't1', 0)
   await say($, 'and what about the logs?')
   await step($, 't2', 0)
   expect(sent[1]?.model).toBe('opus')
-  expect(sent[1]?.effort).toBe('xhigh')
-  expect(notes[1]).toContain('reply #max to use it')
+  expect(sent[1]?.effort).toBe('medium')
+  expect(notes[1]).not.toContain('#max')
+})
+
+test("a #max that Claude wrote in a relayed note does not force max", async ($, on) => {
+  const { sent, asked } = engine(on, '{"tier":"standard","why":"review"}')
+  await say(
+    $,
+    '<relay from="thread"><note>Reply to the user: The router recommends max for this; reply #max to use it.</note></relay>',
+  )
+  await step($, 't1', 0)
+  expect(asked.length).toBe(1)
+  expect(sent[0]?.effort).toBe('high')
+})
+
+test("the person's own #max in a wake does force max", async ($, on) => {
+  const { sent, asked } = engine(on)
+  await say($, '<wake reason="mention"><message from="human" author="Mihai">go deep on it #max</message></wake>')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(0)
+  expect(sent[0]?.effort).toBe('max')
+})
+
+test('a system event keeps the last pick and adds no note', async ($, on) => {
+  const { sent, asked, notes } = engine(on, '{"tier":"hard","why":"bug"}')
+  await say($, 'the app crashes')
+  await say($, '<wake reason="device"><system-note>Device connected.</system-note></wake>')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(1)
+  expect(notes.length).toBe(1)
+  expect(sent[0]?.effort).toBe('xhigh')
+})
+
+test('a message that arrives mid-turn is told it applies from the next turn', async ($, on) => {
+  const { notes } = engine(on, '{"tier":"simple","why":"q"}')
+  await $.prompt.submit({ text: 'and the logs?', wait: false, origin: { kind: 'composer' }, turnId: 't1' })
+  expect(notes[0]).toContain('The turn already running keeps its route')
 })

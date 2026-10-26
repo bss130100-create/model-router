@@ -8,10 +8,11 @@ import {
   describeRouter,
   extractRequest,
   findTag,
-  keepHigherInLongContext,
+  keepStrongerModelInLongContext,
   parseClassifierReply,
   prepareClassifierInput,
   routeNote,
+  unwrap,
   validateConfig,
 } from '../hooks/route'
 
@@ -107,7 +108,48 @@ test('describeRouter lists every tier and the classifier', async () => {
   expect(text).toContain('trivial -> haiku · low')
   expect(text).toContain('max -> opus · max')
   expect(text).toContain('Classifier: haiku · low')
-  expect(text).toContain('Above 100K tokens of context it only moves up a tier')
+  expect(text).toContain('Above 100K tokens of context it never switches to a cheaper model')
+})
+
+// A Projects relay as it arrives, preamble included: the preamble names the
+// <cited> tag in prose, which must not swallow the real elements after it.
+const RELAY = [
+  'A message from the coordinator. Inside, <cited author="user"> entries are messages from members,',
+  'and <cited author="coordinator"> entries and the note are the coordinator\'s words.',
+  '<coordinator-relay><relay from="coordinator" session="s1">',
+  '  <cited id="c1" author="user" name="Mihai">build the HUD export</cited>',
+  '  <cited id="c2" author="coordinator">Earlier: The router recommends max for this; reply #max to use it.</cited>',
+  '  <note>He wants CSV and PDF. #max</note>',
+  '</relay></coordinator-relay>',
+].join('\n')
+
+const WAKE = [
+  '<wake reason="mention" current-time="2026-10-26T17:12:18Z">',
+  '  <project id="chan_1" type="project"><thread ts="cmsg_A">',
+  '    <message trigger="true" from="system" trust="principal" role="initiator">You are a Thread Session #max</message>',
+  '    <message trigger="true" from="human" trust="principal" author="Mihai" id="cmsg_C">it&#39;s live</message>',
+  '  </thread></project>',
+  '  <system-note>If answering this message needs tool calls first...</system-note>',
+  '</wake>',
+].join('\n')
+
+describe('unwrap', () => {
+  test('a plain prompt is all words', async () => {
+    expect(unwrap('fix <b>this</b> bug #hard')).toEqual({ words: 'fix <b>this</b> bug #hard', notes: [] })
+  })
+
+  test("a wake keeps only the human message, not the system's", async () => {
+    expect(unwrap(WAKE)).toEqual({ words: "it's live", notes: [] })
+  })
+
+  test("a relay keeps the user's cited words apart from the notes, past the preamble", async () => {
+    expect(unwrap(RELAY)).toEqual({ words: 'build the HUD export', notes: ['He wants CSV and PDF. #max'] })
+  })
+
+  test("a #max that Claude wrote is not the person's tag", async () => {
+    expect(findTag(unwrap(RELAY).words)).toBe(null)
+    expect(findTag(unwrap(WAKE).words)).toBe(null)
+  })
 })
 
 describe('extractRequest', () => {
@@ -115,57 +157,69 @@ describe('extractRequest', () => {
     expect(extractRequest('fix <b>this</b> bug')).toBe('fix <b>this</b> bug')
   })
 
-  test("a thread wake is unwrapped to the person's words", async () => {
-    const wake = [
-      '<wake reason="mention" current-time="2026-10-26T17:12:18Z">',
-      '  <project id="chan_1" type="project"><thread ts="cmsg_A">',
-      '    <message trigger="true" from="human" trust="principal" author="Mihai" id="cmsg_C">it&#39;s live</message>',
-      '  </thread></project>',
-      '  <system-note>If answering this message needs tool calls first...</system-note>',
-      '</wake>',
-    ].join('\n')
-    expect(extractRequest(wake)).toBe("it's live")
+  test("a wake is the person's words", async () => {
+    expect(extractRequest(WAKE)).toBe("it's live")
   })
 
-  test('a relay keeps the cited words and the note', async () => {
-    const relay = [
-      '<coordinator-relay><relay from="coordinator" session="s1">',
-      '  <cited author="user" name="Mihai">build the HUD export</cited>',
-      '  <note>He wants CSV and PDF.</note>',
-      '</relay></coordinator-relay>',
-    ].join('\n')
-    expect(extractRequest(relay)).toBe('build the HUD export\n(note from a colleague: He wants CSV and PDF.)')
+  test('a relay is the words, then each note marked as a colleague\'s', async () => {
+    expect(extractRequest(RELAY)).toBe('build the HUD export\n(note from a colleague: He wants CSV and PDF. #max)')
   })
 
-  test('a wrapper with no text says so', async () => {
-    expect(extractRequest('<wake reason="mention"><message from="human" has-files="true"></message></wake>')).toBe(
-      '(a message with attachments only, no text)',
+  test('a relay with only a note is the note', async () => {
+    expect(extractRequest('<relay from="thread"><note>Eval done: 96/99.</note></relay>')).toBe(
+      '(note from a colleague: Eval done: 96/99.)',
     )
+  })
+
+  test('a system event or an attachment-only message is empty', async () => {
+    expect(extractRequest('<wake reason="device"><system-note>Device connected.</system-note></wake>')).toBe('')
+    expect(extractRequest('<wake reason="mention"><message from="human" has-files="true"></message></wake>')).toBe('')
   })
 })
 
-describe('keepHigherInLongContext', () => {
+describe('keepStrongerModelInLongContext', () => {
   const hard = decide('hard', 'classifier', 'bug', TIERS)
+  const max = decide('max', 'tag', '#max tag', TIERS)
   const simple = decide('simple', 'classifier', 'question', TIERS)
+  const trivial = decide('trivial', 'classifier', 'thanks', TIERS)
 
   test('a short conversation follows the new pick', async () => {
-    expect(keepHigherInLongContext(simple, hard, 50_000, 100_000)).toBe(simple)
+    expect(keepStrongerModelInLongContext(simple, hard, 50_000, 100_000, TIERS)).toBe(simple)
   })
 
-  test('a long conversation never moves down', async () => {
-    expect(keepHigherInLongContext(simple, hard, 150_000, 100_000)).toEqual({
-      ...hard,
+  test('a long conversation keeps the stronger model but takes the new effort', async () => {
+    expect(keepStrongerModelInLongContext(simple, hard, 150_000, 100_000, TIERS)).toEqual({
+      ...simple,
+      model: 'opus',
+      effort: 'medium',
       source: 'long-context',
-      why: 'kept hard over simple, context 150K tokens',
+      why: 'simple on opus, not sonnet: context 150K tokens',
     })
   })
 
-  test('a long conversation still moves up', async () => {
-    expect(keepHigherInLongContext(hard, simple, 150_000, 100_000)).toBe(hard)
+  test('after #max the next pick does not stay on max', async () => {
+    const kept = keepStrongerModelInLongContext(trivial, max, 150_000, 100_000, TIERS)
+    expect(kept.model).toBe('opus')
+    expect(kept.effort).toBe('low')
+    expect(kept.tier).toBe('trivial')
   })
 
-  test('with no earlier pick the new one stands', async () => {
-    expect(keepHigherInLongContext(simple, null, 150_000, 100_000)).toBe(simple)
+  test('a recommendation is never carried over from an earlier turn', async () => {
+    const recommended = { ...hard, recommended: 'max' as const }
+    expect(keepStrongerModelInLongContext(simple, recommended, 150_000, 100_000, TIERS).recommended).toBe(null)
+  })
+
+  test('the same model keeps the new pick as it is', async () => {
+    const standard = decide('standard', 'classifier', 'feature', TIERS)
+    expect(keepStrongerModelInLongContext(standard, hard, 150_000, 100_000, TIERS)).toBe(standard)
+  })
+
+  test('a long conversation still moves to a stronger model', async () => {
+    expect(keepStrongerModelInLongContext(hard, simple, 150_000, 100_000, TIERS)).toBe(hard)
+  })
+
+  test('with no earlier route the new one stands', async () => {
+    expect(keepStrongerModelInLongContext(simple, null, 150_000, 100_000, TIERS)).toBe(simple)
   })
 })
 
@@ -179,9 +233,10 @@ describe('prepareClassifierInput', () => {
     { role: 'user' as const, text: '<wake reason="mention"><message from="human">plan the HUD rewrite</message></wake>' },
     { role: 'assistant' as const, text: 'Plan: 4 files.' },
     ...Array.from({ length: 8 }, () => ({ role: 'assistant' as const, text: '' })),
+    { role: 'user' as const, text: '<wake reason="device"><system-note>Device connected.</system-note></wake>' },
   ]
 
-  test('drops tool rows before taking the last n, and unwraps every row', async () => {
+  test('drops tool rows and system events before taking the last n, and unwraps every row', async () => {
     expect(prepareClassifierInput('<wake><message from="human">yes</message></wake>', rows, 2)).toEqual({
       prompt: 'yes',
       context: [
@@ -217,13 +272,20 @@ describe('capAutoTier', () => {
 describe('routeNote', () => {
   test('a recommendation tells Claude to say it in the reply', async () => {
     const d = capAutoTier(decide('max', 'classifier', 'stuck', TIERS), 'hard', TIERS)
-    expect(routeNote(d)).toContain(
+    expect(routeNote(d, false)).toContain(
       'Start your reply with this one line: "The router recommends max for this; reply #max to use it."',
     )
   })
 
   test('no recommendation: mention the route only when asked', async () => {
-    expect(routeNote(decide('simple', 'classifier', 'q', TIERS))).toContain('Mention it only if the user asks')
+    expect(routeNote(decide('simple', 'classifier', 'q', TIERS), false)).toContain('Mention it only if the user asks')
+  })
+
+  test('a message that arrives mid-turn is routed for the next turn', async () => {
+    const note = routeNote(decide('simple', 'classifier', 'q', TIERS), true)
+    expect(note).toContain('The router picked sonnet at medium effort (tier simple, picked by classifier: q) for this message.')
+    expect(note).toContain('The turn already running keeps its route; the pick applies from the next turn.')
+    expect(note).not.toContain('This turn runs on')
   })
 })
 

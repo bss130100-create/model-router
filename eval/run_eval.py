@@ -60,10 +60,13 @@ def score(cases, results):
     tally = {m: collections.Counter() for m in FLOORS}
     misses = []
     for r in sorted(results, key=lambda r: (r['mode'], r['id'], r['run'])):
+        # Scored on the tier that runs; a capped pick also counts as a recommendation shown to the person.
         v = verdict(r['tier'], by_case[r['id']])
         tally[r['mode']][v] += 1
+        tally[r['mode']]['recommended'] += r.get('recommended') is not None
+        picked = r['tier'] if r['classified'] == r['tier'] else f"{r['classified']}->{r['tier']}"
         if v != 'ok':
-            misses.append(f"{r['mode']:7} {r['id']:6} {r['tier']:8} ({v}; expected {'/'.join(by_case[r['id']]['ok'])}): {r['why']}")
+            misses.append(f"{r['mode']:7} {r['id']:6} {picked:13} ({v}; expected {'/'.join(by_case[r['id']]['ok'])}): {r['why']}")
     return tally, misses
 
 
@@ -83,10 +86,11 @@ def main():
     print('\n'.join(misses) or 'no misses')
     passed = True
     for mode, t in tally.items():
-        total = sum(t.values())
+        total = t['ok'] + t['over'] + t['under']
         rate = t['ok'] / total
         passed &= rate >= FLOORS[mode]
-        print(f"{mode:7} {t['ok']}/{total} in range ({rate:.0%}, floor {FLOORS[mode]:.0%}), too high {t['over']}, too low {t['under']}")
+        print(f"{mode:7} {t['ok']}/{total} in range ({rate:.0%}, floor {FLOORS[mode]:.0%}), too high {t['over']}, "
+              f"too low {t['under']}, max recommended {t['recommended']}")
     sys.exit(0 if passed else 1)
 
 

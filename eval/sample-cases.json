@@ -1,7 +1,7 @@
 [
  {
   "id": "S1",
-  "where": "netscan",
+  "where": "app thread",
   "text": "thanks, that works",
   "ideal": "trivial",
   "ok": ["trivial", "simple"],

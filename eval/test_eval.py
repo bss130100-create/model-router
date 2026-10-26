@@ -20,12 +20,22 @@ class EvalTest(unittest.TestCase):
         self.assertEqual(ev.verdict('simple', CASES[1]), 'under')
 
     def test_score_counts_and_lists_misses(self):
-        results = [{'id': 'X1', 'mode': 'context', 'run': 1, 'ok': True, 'tier': 'trivial', 'why': 'a'},
-                   {'id': 'X2', 'mode': 'thread', 'run': 1, 'ok': True, 'tier': 'max', 'why': 'b'}]
+        results = [{'id': 'X1', 'mode': 'context', 'run': 1, 'ok': True, 'classified': 'trivial', 'tier': 'trivial',
+                    'recommended': None, 'why': 'a'},
+                   {'id': 'X2', 'mode': 'thread', 'run': 1, 'ok': True, 'classified': 'max', 'tier': 'max',
+                    'recommended': None, 'why': 'b'}]
         tally, misses = ev.score(CASES, results)
         self.assertEqual(tally['context']['ok'], 1)
         self.assertEqual(tally['thread']['over'], 1)
         self.assertEqual(len(misses), 1)
+
+    def test_a_capped_pick_is_scored_on_the_tier_that_runs_and_counted_as_a_recommendation(self):
+        results = [{'id': 'X2', 'mode': 'thread', 'run': 1, 'ok': True, 'classified': 'max', 'tier': 'hard',
+                    'recommended': 'max', 'why': 'big build'}]
+        tally, misses = ev.score(CASES, results)
+        self.assertEqual(tally['thread']['ok'], 1)
+        self.assertEqual(tally['thread']['recommended'], 1)
+        self.assertEqual(misses, [])
 
     def test_failed_call_stops_the_eval(self):
         with self.assertRaises(RuntimeError):

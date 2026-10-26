@@ -1,12 +1,12 @@
 // Eval harness: runs model-router's real classifier path over a cases file.
-// run.sh copies the repo's hooks/route.ts, hooks/rules.ts and types next to this file first.
+// run_eval.py copies the repo's hooks/route.ts, hooks/rules.ts and types next to this file first.
 import type { EngineInterface, Register } from 'claude-code'
 
-import { CLASSIFIER, TIERS } from './rules'
-import { buildClassifierRequest, parseClassifierReply, prepareClassifierInput } from './route'
-import type { ContextMessage } from './route'
+import { AUTO_TIER_CAP, CLASSIFIER, TIERS } from './rules'
+import { buildClassifierRequest, capAutoTier, decide, parseClassifierReply, prepareClassifierInput } from './route'
+import type { SessionRow } from './route'
 
-type Job = { id: string; mode: 'context' | 'thread'; run: number; prompt: string; rows: ContextMessage[] }
+type Job = { id: string; mode: 'context' | 'thread'; run: number; prompt: string; rows: SessionRow[] }
 
 async function classify($: EngineInterface, job: Job) {
   const input = prepareClassifierInput(job.prompt, job.rows, CLASSIFIER.contextMessages)
@@ -25,7 +25,10 @@ async function classify($: EngineInterface, job: Job) {
     return { ...base, ok: false, error: reply.reason }
   }
   try {
-    return { ...base, ok: true, ...parseClassifierReply(reply.text) }
+    const { tier, why } = parseClassifierReply(reply.text)
+    // The tier that runs: above AUTO_TIER_CAP the router runs the cap and recommends the higher tier.
+    const ran = capAutoTier(decide(tier, 'classifier', why, TIERS), AUTO_TIER_CAP, TIERS)
+    return { ...base, ok: true, classified: tier, tier: ran.tier, recommended: ran.recommended, why }
   } catch (err) {
     return { ...base, ok: false, error: err instanceof Error ? err.message : String(err), raw: reply.text }
   }

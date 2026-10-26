@@ -56,7 +56,13 @@ say so. Your prompt is never blocked by the router.
 A mistake in `rules.ts` (an unknown effort, a missing tier, an empty guide) stops
 the mod from loading, and Claude Code shows the reason.
 
-## Commands
+## Checking it
+
+Ask Claude "which route are you on?". The router adds a one-line hidden note to
+each prompt telling Claude the model, effort and tier it picked, so this works
+everywhere, including Projects threads where slash commands cannot run.
+
+## Commands (terminal and desktop Code sessions)
 
 - `/route` shows on/off, the last pick, and every rule.
 - `/route off` stops routing; your normal `/model` setting applies again.

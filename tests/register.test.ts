@@ -11,7 +11,11 @@ function engine(on: On, reply: string | 'api-error' = '{"tier":"standard","why":
   const sent: TurnStepInput[] = []
   const asked: ModelCompleteRequest[] = []
   on('command.register', () => ({ value: { command: 'route' } }))
-  on('prompt.submit', (_, e) => ({ text: e.text }))
+  const notes: string[] = []
+  on('prompt.submit', (_, e) => {
+    notes.push(...(e.context ?? []))
+    return { text: e.text }
+  })
   on('ui.toast', () => ({ value: undefined }))
   on('session.messages', () => ({
     value: [
@@ -32,7 +36,7 @@ function engine(on: On, reply: string | 'api-error' = '{"tier":"standard","why":
     sent.push(e)
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
   })
-  return { sent, asked }
+  return { sent, asked, notes }
 }
 
 async function step($: Engine, turnId: string, index: number, agentId?: string) {
@@ -167,4 +171,19 @@ test('/route with a wrong option says so', async ($, on) => {
   engine(on)
   const shown = await route($, 'banana')
   expect(shown.text).toContain('Unknown option "banana"')
+})
+
+test('the answering model is told its route', async ($, on) => {
+  const { notes } = engine(on, '{"tier":"hard","why":"intermittent crash"}')
+  await say($, 'the scan sometimes freezes')
+  expect(notes[0]).toBe(
+    '[model-router] This turn runs on opus at xhigh effort (tier hard, picked by classifier: intermittent crash). Mention it only if the user asks which model, effort or route is in use.',
+  )
+})
+
+test('routing off adds no note', async ($, on) => {
+  const { notes } = engine(on)
+  await route($, 'off')
+  await say($, 'what is this?')
+  expect(notes.length).toBe(0)
 })

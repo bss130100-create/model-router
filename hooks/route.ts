@@ -139,6 +139,12 @@ export function label(d: ModelRouterDecision): string {
   return d.source === 'error' ? `${head} CLASSIFIER FAILED: ${d.why}` : head
 }
 
+/** The hidden note the answering model reads beside the prompt. */
+export function routeNote(d: ModelRouterDecision): string {
+  const why = d.why === '' ? '' : `: ${d.why}`
+  return `[model-router] This turn runs on ${d.model} at ${d.effort} effort (tier ${d.tier}, picked by ${d.source}${why}). Mention it only if the user asks which model, effort or route is in use.`
+}
+
 /** The text /route prints: on or off, the last pick, tiers and classifier. */
 export function describeRouter(
   isOff: boolean,

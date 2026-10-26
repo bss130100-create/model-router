@@ -10,6 +10,7 @@ import {
   findTag,
   label,
   parseClassifierReply,
+  routeNote,
   validateConfig,
 } from './route'
 
@@ -74,7 +75,9 @@ export const register: Register = on => {
     const decision = tag === null ? await classify($, e.text) : decide(tag, 'tag', `#${tag} tag`, TIERS)
     await update($, last, () => decision)
     $.ui.status(label(decision))
-    return next(e)
+    // Tell the answering model its route, so in any session (Projects threads
+    // included, where /route cannot run) you can ask "which route are you on?".
+    return next({ ...e, context: [...(e.context ?? []), routeNote(decision)] })
   }).catch(async ($, e, next) => {
     // Never reuse a stale pick: clear it, say so, and let the prompt through.
     await update($, last, () => null)

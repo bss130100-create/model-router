@@ -5,6 +5,7 @@ import type {
   ModelRouterTier,
   ModelRouterTierSpec,
 } from '../types'
+import { MODEL } from './rules'
 
 export const TIER_ORDER: readonly ModelRouterTier[] = ['trivial', 'simple', 'standard', 'hard', 'max']
 const EFFORTS: readonly ModelRouterEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
@@ -19,22 +20,28 @@ export type ContextMessage = { role: 'user' | 'assistant'; text: string }
 /** Throws on the first mistake in rules.ts, so a bad edit never loads silently. */
 export function validateConfig(
   tiers: Tiers,
+  model: string,
   classifier: ModelRouterClassifier,
   onError: ModelRouterTier,
-  longContextTokens: number,
   autoTierCap: ModelRouterTier,
 ): void {
+  if (model.trim() === '') {
+    throw new Error('model-router: MODEL is empty')
+  }
   for (const tier of TIER_ORDER) {
     const spec = tiers[tier]
     if (spec === undefined) {
       throw new Error(`model-router: TIERS is missing "${tier}"`)
     }
-    checkModelAndEffort(`tier "${tier}"`, spec.model, spec.effort)
+    checkEffort(`tier "${tier}"`, spec.effort)
     if (spec.guide.trim() === '') {
       throw new Error(`model-router: tier "${tier}" has an empty guide`)
     }
   }
-  checkModelAndEffort('CLASSIFIER', classifier.model, classifier.effort)
+  if (classifier.model.trim() === '') {
+    throw new Error('model-router: CLASSIFIER has an empty model')
+  }
+  checkEffort('CLASSIFIER', classifier.effort)
   if (!Number.isInteger(classifier.timeoutMs) || classifier.timeoutMs <= 0) {
     throw new Error('model-router: CLASSIFIER.timeoutMs must be a whole number above 0')
   }
@@ -47,15 +54,9 @@ export function validateConfig(
   if (!TIER_ORDER.includes(autoTierCap)) {
     throw new Error(`model-router: AUTO_TIER_CAP "${autoTierCap}" is not a tier`)
   }
-  if (!Number.isInteger(longContextTokens) || longContextTokens <= 0) {
-    throw new Error('model-router: LONG_CONTEXT_TOKENS must be a whole number above 0')
-  }
 }
 
-function checkModelAndEffort(where: string, model: string, effort: ModelRouterEffort): void {
-  if (model.trim() === '') {
-    throw new Error(`model-router: ${where} has an empty model`)
-  }
+function checkEffort(where: string, effort: ModelRouterEffort): void {
   if (!EFFORTS.includes(effort)) {
     throw new Error(`model-router: ${where} has effort "${effort}"; use one of ${EFFORTS.join(', ')}`)
   }
@@ -102,19 +103,25 @@ function inner(text: string, tag: string, attr: RegExp): string[] {
 /** A prompt as the router reads it: the person's own words, and colleagues' notes. */
 export type Unwrapped = { words: string; notes: string[] }
 
+// What the harness adds to a user row (a background task's notification, a
+// reminder): never the person's words.
+const HARNESS_BLOCK = /<(task-notification|system-reminder)\b[\s\S]*?<\/\1>/g
+
 /**
  * In a Projects thread a prompt arrives wrapped in XML: a <wake> holding
  * <message>s, or a <relay> holding <cited> messages and a <note>. Only a
  * message from="human" and a cited author="user" are the person's words;
  * notes are what another Claude wrote. Everything else (ids, system notes,
- * messages from the system) is left out. A prompt with no wrapper is all words.
+ * messages from the system) is left out, and so is what the harness adds (a
+ * background task's notification, a reminder). A prompt with no wrapper is all words.
  */
 export function unwrap(text: string): Unwrapped {
-  if (!/<(wake|relay|coordinator-relay)\b/.test(text)) {
-    return { words: text, notes: [] }
+  const own = text.replace(HARNESS_BLOCK, '')
+  if (!/<(wake|relay|coordinator-relay)\b/.test(own)) {
+    return { words: own, notes: [] }
   }
-  const words = [...inner(text, 'message', /\bfrom="human"/), ...inner(text, 'cited', /\bauthor="user"/)]
-  return { words: words.join('\n'), notes: inner(text, 'note', /^/) }
+  const words = [...inner(own, 'message', /\bfrom="human"/), ...inner(own, 'cited', /\bauthor="user"/)]
+  return { words: words.join('\n'), notes: inner(own, 'note', /^/) }
 }
 
 /**
@@ -126,36 +133,6 @@ export function extractRequest(text: string): string {
   const { words, notes } = unwrap(text)
   const parts = [...(words.trim() === '' ? [] : [words]), ...notes.map(n => `(note from a colleague: ${n})`)]
   return parts.join('\n')
-}
-
-/**
- * Models from cheapest to strongest, ranked by the first tier that uses
- * each; -1 for a model no tier uses.
- */
-function modelRank(model: string, tiers: Tiers): number {
-  return TIER_ORDER.findIndex(t => tiers[t].model === model)
-}
-
-/**
- * In a long conversation every tier runs on at least the model normal work
- * runs on (the standard tier's). Each model keeps its own prompt cache, so a
- * turn on a cheaper model re-reads the whole conversation at full price, and
- * so does the turn that goes back. An effort change keeps the cache, so the
- * tier's effort still applies, and a stronger model is allowed. The context
- * size comes from the session, so a restart cannot lose the rule.
- */
-export function floorModelInLongContext(
-  d: ModelRouterDecision,
-  contextTokens: number,
-  limit: number,
-  tiers: Tiers,
-): ModelRouterDecision {
-  const floor = tiers.standard.model
-  if (contextTokens <= limit || modelRank(d.model, tiers) >= modelRank(floor, tiers)) {
-    return d
-  }
-  const kept = `on ${floor}, not ${d.model}: context ${Math.round(contextTokens / 1000)}K tokens`
-  return { ...d, model: floor, why: d.why === '' ? kept : `${d.why}; ${kept}` }
 }
 
 /**
@@ -184,7 +161,7 @@ export function carryPick(d: ModelRouterDecision, cap: ModelRouterTier, tiers: T
 
 /**
  * A recommendation holds the work until the person answers yes or no. The
- * turn that asks does no work, so it runs on the cheapest tier.
+ * turn that asks does no work, so it runs at the lowest effort.
  */
 export function holdForAnswer(d: ModelRouterDecision, tiers: Tiers): ModelRouterDecision {
   if (d.recommended === null) {
@@ -193,19 +170,31 @@ export function holdForAnswer(d: ModelRouterDecision, tiers: Tiers): ModelRouter
   return { ...decide(TIER_ORDER[0] as ModelRouterTier, d.source, d.why, tiers), recommended: d.recommended }
 }
 
-const YES = ['yes', 'y', 'yeah', 'yep', 'yup', 'ok', 'okay', 'sure', 'go', 'do', 'proceed']
+const YES = ['yes', 'y', 'yeah', 'yep', 'yup', 'ok', 'okay', 'sure', 'proceed']
 const NO = ['no', 'n', 'nope', 'nah']
+// A yes only when the whole message is made of them: "go", "do it", "go ahead".
+const GO = ['go', 'ahead', 'do', 'it', 'for']
 
-/** The person's yes or no, read from the first word of their message; null for anything else. */
+/**
+ * The person's yes or no to the router's question; null for anything else,
+ * which is then classified as a new request. A message that opens with a yes
+ * word is a yes, and one that opens with a no word is a no, unless it also
+ * holds the opposite ("ok wait, no"). "go" and "do" count only in a message
+ * made of nothing else, so "do it at hard instead" or "do you think..." is not a yes.
+ */
 export function readAnswer(words: string): 'yes' | 'no' | null {
-  const first = words.trim().toLowerCase().match(/^[a-z]+/)
-  if (first === null) {
+  const tokens = words.toLowerCase().match(/[a-z]+/g) ?? []
+  const first = tokens[0]
+  if (first === undefined) {
     return null
   }
-  if (YES.includes(first[0])) {
-    return 'yes'
+  if (YES.includes(first)) {
+    return tokens.some(t => NO.includes(t)) ? null : 'yes'
   }
-  return NO.includes(first[0]) ? 'no' : null
+  if (NO.includes(first)) {
+    return tokens.some(t => YES.includes(t)) ? null : 'no'
+  }
+  return tokens.every(t => GO.includes(t)) ? 'yes' : null
 }
 
 /** The one line Claude replies with while the work is held. */
@@ -310,6 +299,10 @@ export function buildClassifierRequest(
     '- Accuracy matters more than cost. When unsure between two tiers, pick the higher one.',
     '- Judge the work the request asks for, not how long the request is.',
     '- Pick for the work the ASSISTANT must do next, not for how much the user wrote.',
+    '- Earlier trouble in the conversation raises the tier only when the new request asks to',
+    '  keep working on that trouble.',
+    '- max is only for a user stuck on the same problem after several failed fixes, or a',
+    '  decision with large consequences. A big build (many features, files or batches) is hard.',
     '- When the user confirms a step the assistant said it would act on next (for example',
     '  "it is live" after "tell me when the repo exists and I will push"), pick the tier of',
     '  that work. An acknowledgement that leaves the assistant nothing to do stays trivial.',
@@ -330,14 +323,19 @@ export function buildClassifierRequest(
   return { system, prompt: user }
 }
 
-/** Reads the classifier's JSON answer; throws when it is not a known tier. */
+/**
+ * Reads the classifier's answer: one JSON object and nothing else (a code
+ * fence around it is allowed). Throws on anything else, or an unknown tier.
+ */
 export function parseClassifierReply(text: string): { tier: ModelRouterTier; why: string } {
-  const json = text.match(/\{[^{}]*\}/)
-  if (json === null) {
-    throw new Error(`no JSON in classifier reply: ${cut(text, 80)}`)
+  const body = text.trim().replace(/^```(?:json)?\s*([\s\S]*?)\s*```$/, '$1')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    throw new Error(`classifier reply is not one JSON object: ${cut(text, 80)}`)
   }
-  const parsed: unknown = JSON.parse(json[0])
-  if (typeof parsed !== 'object' || parsed === null) {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new Error('classifier reply is not an object')
   }
   const { tier, why } = parsed as { tier?: unknown; why?: unknown }
@@ -356,7 +354,7 @@ export function decide(
   why: string,
   tiers: Tiers,
 ): ModelRouterDecision {
-  return { tier, source, why, model: tiers[tier].model, effort: tiers[tier].effort, recommended: null }
+  return { tier, source, why, model: MODEL, effort: tiers[tier].effort, recommended: null }
 }
 
 export function label(d: ModelRouterDecision): string {
@@ -390,7 +388,15 @@ export function routeNote(d: ModelRouterDecision, isMidTurn: boolean, cap: Model
   if (d.source === 'answer') {
     return `${base} The user has answered the router's question about the request you held back: do that request now, taking their reply into account.`
   }
-  return `${base} Mention it only if the user asks which model, effort or route is in use.`
+  if (d.source === 'error') {
+    return `${base} The router's classifier failed, so this runs at the fallback tier: tell the user so in one short line of your reply.`
+  }
+  return [
+    base,
+    'Mention it only if the user asks which model, effort or route is in use.',
+    'The router sets the model and effort of every turn, so changing them in the session has no effect:',
+    'to change the effort, the user types #trivial, #simple, #standard, #hard or #max in a message.',
+  ].join(' ')
 }
 
 /** The text /route prints: on or off, the last pick, tiers and classifier. */
@@ -398,9 +404,9 @@ export function describeRouter(
   isOff: boolean,
   last: ModelRouterDecision | null,
   tiers: Tiers,
+  model: string,
   classifier: ModelRouterClassifier,
   onError: ModelRouterTier,
-  longContextTokens: number,
   autoTierCap: ModelRouterTier,
 ): string {
   const pick =
@@ -409,13 +415,12 @@ export function describeRouter(
     `Model router is ${isOff ? 'OFF (your /model setting applies)' : 'ON'}.`,
     `Last pick: ${pick}`,
     '',
-    'Tiers, cheapest first (type #<tier> in a prompt to force one):',
-    ...TIER_ORDER.map(t => `  ${t} -> ${tiers[t].model} · ${tiers[t].effort}`),
+    `Every tier runs on ${model}; the tier sets the effort (type #<tier> in a prompt to force one):`,
+    ...TIER_ORDER.map(t => `  ${t} -> ${tiers[t].effort}`),
     '',
     `Classifier: ${classifier.model} · ${classifier.effort}, reads the last ${classifier.contextMessages} messages.`,
     `If it fails: ${onError}.`,
     `It picks up to ${autoTierCap} on its own. For a higher tier it asks first: yes runs it, no runs ${autoTierCap}.`,
-    `Above ${Math.round(longContextTokens / 1000)}K tokens of context every tier runs on at least ${tiers.standard.model}; effort still follows the tier.`,
     '',
     'Edit hooks/rules.ts to change them. /route off or /route on to switch.',
   ].join('\n')

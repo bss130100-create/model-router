@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, TurnStepInput } from 'claude-code'
 
 import type { ModelRouterDecision, ModelRouterTurnLock } from '../types'
-import { AUTO_TIER_CAP, CLASSIFIER, LONG_CONTEXT_TOKENS, ON_CLASSIFIER_ERROR, TIERS } from './rules'
+import { AUTO_TIER_CAP, CLASSIFIER, MODEL, ON_CLASSIFIER_ERROR, TIERS } from './rules'
 import {
   answerHeld,
   buildClassifierRequest,
@@ -13,7 +13,6 @@ import {
   extractRequest,
   findHeldQuestion,
   findTag,
-  floorModelInLongContext,
   holdForAnswer,
   label,
   parseClassifierReply,
@@ -28,10 +27,10 @@ import type { SessionRow } from './route'
 // Change a shape tag when that value's fields change: it declines what an
 // earlier version stored, which outlives a reload.
 const last = atom({ plugin: 'model-router', key: 'last' } as const, null as ModelRouterDecision | null, {
-  shape: 'decision-5',
+  shape: 'decision-6',
 })
 const lock = atom({ plugin: 'model-router', key: 'lock' } as const, null as ModelRouterTurnLock | null, {
-  shape: 'lock-5',
+  shape: 'lock-6',
 })
 const isOff = atom({ plugin: 'model-router', key: 'isOff' } as const, false)
 
@@ -68,21 +67,12 @@ async function pick($: EngineInterface, text: string, rows: readonly SessionRow[
 }
 
 /**
- * How many tokens the conversation holds: what the last response was
- * answered over, which the session keeps across a restart or a resume.
- * Absent before the first response, when the conversation is new.
- */
-async function contextSize($: EngineInterface): Promise<number> {
-  return (await $.session.usage()).context.tokens ?? 0
-}
-
-/**
  * The tier for a prompt. Only the person's own words can force a tier or
  * answer the router's question: a #max or "yes" that Claude wrote, relayed or
  * quoted in a note, must not. A #tag wins, then a yes or no to the question
  * Claude last asked (read from the transcript), then the classifier.
  */
-async function chooseTier($: EngineInterface, text: string): Promise<ModelRouterDecision> {
+async function choose($: EngineInterface, text: string): Promise<ModelRouterDecision> {
   const words = unwrap(text).words
   const tag = findTag(words)
   if (tag !== null) {
@@ -97,22 +87,9 @@ async function chooseTier($: EngineInterface, text: string): Promise<ModelRouter
   return pick($, text, rows)
 }
 
-/** The route for a prompt: its tier, on at least the standard model in a long conversation. */
-async function choose($: EngineInterface, text: string): Promise<ModelRouterDecision> {
-  const tier = await chooseTier($, text)
-  return floorModelInLongContext(tier, await contextSize($), LONG_CONTEXT_TOKENS, TIERS)
-}
-
-/**
- * The route a turn the person did not start carries: their last pick, never
- * above AUTO_TIER_CAP, and on at least the standard model in a long
- * conversation (it may have grown past the limit since).
- */
+/** The route a turn the person did not start carries: their last pick, never above AUTO_TIER_CAP. */
 async function carry($: EngineInterface): Promise<void> {
-  const tokens = await contextSize($)
-  const carried = await update($, last, d =>
-    d === null ? null : floorModelInLongContext(carryPick(d, AUTO_TIER_CAP, TIERS), tokens, LONG_CONTEXT_TOKENS, TIERS),
-  )
+  const carried = await update($, last, d => (d === null ? null : carryPick(d, AUTO_TIER_CAP, TIERS)))
   if (carried !== null) {
     $.ui.status(label(carried))
   }
@@ -143,7 +120,7 @@ async function routeStep($: EngineInterface, e: TurnStepInput): Promise<TurnStep
 
 export const register: Register = on => {
   // Fail fast: a broken rules.ts stops the mod from loading, with the reason.
-  validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)
+  validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -207,9 +184,9 @@ export const register: Register = on => {
         await read($, isOff),
         await read($, last),
         TIERS,
+        MODEL,
         CLASSIFIER,
         ON_CLASSIFIER_ERROR,
-        LONG_CONTEXT_TOKENS,
         AUTO_TIER_CAP,
       ),
     }

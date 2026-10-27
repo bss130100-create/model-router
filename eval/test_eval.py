@@ -29,13 +29,18 @@ class EvalTest(unittest.TestCase):
         self.assertEqual(tally['thread']['over'], 1)
         self.assertEqual(len(misses), 1)
 
-    def test_a_capped_pick_is_scored_on_the_tier_that_runs_and_counted_as_a_recommendation(self):
+    def test_a_needless_max_recommendation_is_a_stall_whatever_runs_after(self):
         results = [{'id': 'X2', 'mode': 'thread', 'run': 1, 'ok': True, 'classified': 'max', 'tier': 'hard',
                     'recommended': 'max', 'why': 'big build'}]
         tally, misses = ev.score(CASES, results)
-        self.assertEqual(tally['thread']['ok'], 1)
+        self.assertEqual(tally['thread']['ok'], 0)
+        self.assertEqual(tally['thread']['stall'], 1)
         self.assertEqual(tally['thread']['recommended'], 1)
-        self.assertEqual(misses, [])
+        self.assertEqual(len(misses), 1)
+
+    def test_a_recommendation_the_case_accepts_is_ok(self):
+        case = dict(CASES[1], ok=['hard', 'max'])
+        self.assertEqual(ev.verdict('hard', case, 'max'), 'ok')
 
     def test_failed_call_stops_the_eval(self):
         with self.assertRaises(RuntimeError):

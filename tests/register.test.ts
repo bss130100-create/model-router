@@ -10,12 +10,7 @@ const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, c
 // engine. `reply` is what the classifier model answers; `asked` records
 // what it was asked, `sent` the model requests the router let through.
 // A test adds to `rows` what the transcript holds after the fixed opening.
-function engine(
-  on: On,
-  reply: string | readonly string[] | 'api-error' = '{"tier":"standard","why":"x"}',
-  contextTokens: number | (() => number) = 1000,
-) {
-  const size = typeof contextTokens === 'number' ? () => contextTokens : contextTokens
+function engine(on: On, reply: string | readonly string[] | 'api-error' = '{"tier":"standard","why":"x"}') {
   const sent: TurnStepInput[] = []
   const asked: ModelCompleteRequest[] = []
   const rows: SessionRow[] = []
@@ -26,10 +21,6 @@ function engine(
     return { text: e.text }
   })
   on('ui.toast', () => ({ value: undefined }))
-  // What the session reports as the conversation's size; a restart keeps it.
-  on('session.usage', () => ({
-    value: { startedAt: 0, context: { tokens: size(), window: 1_000_000 }, rateLimits: [] },
-  }))
   on('session.messages', () => ({
     value: [
       { role: 'user', text: 'Can you plan a rewrite of the scanner?', toolUses: [] },
@@ -59,7 +50,7 @@ function engine(
       answer: '',
       toolUses: [],
       stopReason: 'end_turn',
-      usage: { ...USAGE, cache_read_input_tokens: size(), model: e.model },
+      usage: { ...USAGE, model: e.model },
     }
   })
   return { sent, asked, notes, rows }
@@ -107,12 +98,24 @@ test('the classifier tier picks the model and effort', async ($, on) => {
   expect(sent[0]?.effort).toBe('xhigh')
 })
 
-test('trivial prompts go to haiku', async ($, on) => {
+test('trivial prompts run on opus at low effort, from the first prompt of a conversation', async ($, on) => {
   const { sent } = engine(on, '{"tier":"trivial","why":"thanks"}')
   await say($, 'thanks!')
   await step($, 't1', 0)
-  expect(sent[0]?.model).toBe('haiku')
+  expect(sent[0]?.model).toBe('opus')
   expect(sent[0]?.effort).toBe('low')
+})
+
+test('the model never changes between tiers, so the prompt cache is kept; only the effort moves', async ($, on) => {
+  const { sent } = engine(on, ['{"tier":"hard","why":"bug"}', '{"tier":"trivial","why":"thanks"}', '{"tier":"simple","why":"q"}'])
+  await say($, 'the app crashes')
+  await step($, 't1', 0)
+  await say($, 'thanks!')
+  await step($, 't2', 0)
+  await say($, 'what does the cache do?')
+  await step($, 't3', 0)
+  expect(sent.map(s => s.model)).toEqual(['opus', 'opus', 'opus'])
+  expect(sent.map(s => s.effort)).toEqual(['xhigh', 'low', 'medium'])
 })
 
 test('the classifier reads the recent conversation', async ($, on) => {
@@ -141,13 +144,14 @@ test('a classifier API error uses the declared error tier', async ($, on) => {
   expect(shown.text).toContain('CLASSIFIER FAILED: api-error')
 })
 
-test('an unreadable classifier answer uses the declared error tier', async ($, on) => {
-  const { sent } = engine(on, 'I think it is hard')
+test('an unreadable classifier answer uses the declared error tier, and Claude is told to say so', async ($, on) => {
+  const { sent, notes } = engine(on, 'I think it is hard')
   await say($, 'build the export feature')
   await step($, 't1', 0)
   expect(sent[0]?.effort).toBe('high')
   const shown = await route($, '')
   expect(shown.text).toContain('by error')
+  expect(notes[0]).toContain("The router's classifier failed")
 })
 
 test('a prompt typed mid-turn waits for the next turn', async ($, on) => {
@@ -157,7 +161,6 @@ test('a prompt typed mid-turn waits for the next turn', async ($, on) => {
   await say($, 'it still crashes #hard')
   await step($, 't1', 1)
   await step($, 't2', 0)
-  expect(sent.map(s => s.model)).toEqual(['sonnet', 'sonnet', 'opus'])
   expect(sent.map(s => s.effort)).toEqual(['medium', 'medium', 'xhigh'])
 })
 
@@ -187,7 +190,8 @@ test('/route off stops routing and /route on starts it again', async ($, on) => 
   await route($, 'on')
   await say($, 'what is this?')
   await step($, 't2', 0)
-  expect(sent[1]?.model).toBe('sonnet')
+  expect(sent[1]?.model).toBe('opus')
+  expect(sent[1]?.effort).toBe('medium')
 })
 
 test('/route shows the last pick and why', async ($, on) => {
@@ -207,7 +211,7 @@ test('the answering model is told its route', async ($, on) => {
   const { notes } = engine(on, '{"tier":"hard","why":"intermittent crash"}')
   await say($, 'the scan sometimes freezes')
   expect(notes[0]).toBe(
-    '[model-router] This turn runs on opus at xhigh effort (tier hard, picked by classifier: intermittent crash). Mention it only if the user asks which model, effort or route is in use.',
+    '[model-router] This turn runs on opus at xhigh effort (tier hard, picked by classifier: intermittent crash). Mention it only if the user asks which model, effort or route is in use. The router sets the model and effort of every turn, so changing them in the session has no effect: to change the effort, the user types #trivial, #simple, #standard, #hard or #max in a message.',
   )
 })
 
@@ -241,55 +245,6 @@ test('a background-task notification carries the last pick', async ($, on) => {
   expect(sent[0]?.effort).toBe('xhigh')
 })
 
-test('in a long conversation the model stays but the effort follows the new tier', async ($, on) => {
-  const { sent } = engine(on, ['{"tier":"hard","why":"bug"}', '{"tier":"trivial","why":"thanks"}'], 150_000)
-  await say($, 'the app crashes')
-  await step($, 't1', 0)
-  // The next prompt classifies lower, but the conversation is now 150K tokens.
-  await say($, 'thanks!')
-  await step($, 't2', 0)
-  expect(sent[1]?.model).toBe('opus')
-  expect(sent[1]?.effort).toBe('low')
-  const shown = await route($, '')
-  expect(shown.text).toContain('by classifier: thanks; on opus, not haiku: context 150K tokens')
-})
-
-test('in a long conversation the rule holds after a restart, with no earlier turn in memory', async ($, on) => {
-  // A fresh process on a resumed 150K-token thread: only the session knows its size.
-  const { sent } = engine(on, '{"tier":"trivial","why":"status question"}', 150_000)
-  await say($, 'what route are you on?')
-  await step($, 't1', 0)
-  expect(sent[0]?.model).toBe('opus')
-  expect(sent[0]?.effort).toBe('low')
-})
-
-test('in a long conversation a cheap pick never starts another cache', async ($, on) => {
-  const { sent } = engine(on, ['{"tier":"trivial","why":"thanks"}', '{"tier":"simple","why":"explain"}'], 150_000)
-  await say($, 'thanks!')
-  await step($, 't1', 0)
-  await say($, 'what does the cache do?')
-  await step($, 't2', 0)
-  expect(sent.map(s => s.model)).toEqual(['opus', 'opus'])
-  expect(sent.map(s => s.effort)).toEqual(['low', 'medium'])
-})
-
-test('in a long conversation a #tag sets the effort and the model stays opus', async ($, on) => {
-  const { sent } = engine(on, '{"tier":"hard","why":"bug"}', 150_000)
-  await say($, 'the app crashes')
-  await step($, 't1', 0)
-  await say($, 'thanks #trivial')
-  await step($, 't2', 0)
-  expect(sent[1]?.model).toBe('opus')
-  expect(sent[1]?.effort).toBe('low')
-})
-
-test('a short conversation still uses the cheaper models', async ($, on) => {
-  const { sent } = engine(on, '{"tier":"simple","why":"explain"}', 20_000)
-  await say($, 'what is a venv?')
-  await step($, 't1', 0)
-  expect(sent[0]?.model).toBe('sonnet')
-})
-
 const STUCK = '{"tier":"max","why":"stuck after 4 fixes"}'
 const ASK = 'The router recommends max for this. Reply yes to run it at max, or no to run it at hard.'
 
@@ -298,11 +253,11 @@ function asked_max(rows: SessionRow[]) {
   rows.push({ role: 'user', text: 'we tried 4 fixes and it still fails' }, { role: 'assistant', text: ASK })
 }
 
-test('a max pick starts no work: the turn only asks, on the cheapest tier', async ($, on) => {
+test('a max pick starts no work: the turn only asks, at the lowest effort', async ($, on) => {
   const { sent, notes } = engine(on, STUCK)
   await say($, 'we tried 4 fixes and it still fails')
   await step($, 't1', 0)
-  expect(sent[0]?.model).toBe('haiku')
+  expect(sent[0]?.model).toBe('opus')
   expect(sent[0]?.effort).toBe('low')
   expect(notes[0]).toContain('Do not start the work')
   expect(notes[0]).toContain(`"${ASK}"`)
@@ -347,7 +302,7 @@ test('any other reply is classified as a new request, and a later yes is ordinar
   await say($, 'first, what does the log say?')
   await step($, 't1', 0)
   expect(asked.length).toBe(1)
-  expect(sent[0]?.model).toBe('sonnet')
+  expect(sent[0]?.effort).toBe('medium')
   rows.push({ role: 'user', text: 'first, what does the log say?' }, { role: 'assistant', text: 'It says timeout.' })
   await say($, 'yes')
   await step($, 't2', 0)
@@ -355,14 +310,26 @@ test('any other reply is classified as a new request, and a later yes is ordinar
   expect(sent[1]?.effort).toBe('low')
 })
 
-test('in a long conversation the asking turn keeps opus, at low effort', async ($, on) => {
-  const { sent } = engine(on, ['{"tier":"standard","why":"feature"}', STUCK], 150_000)
-  await say($, 'add the export')
+test('"do it at hard instead" is not a yes: it is classified as a new request', async ($, on) => {
+  const { sent, asked, rows } = engine(on, '{"tier":"hard","why":"bug"}')
+  asked_max(rows)
+  await say($, 'do it at hard instead')
   await step($, 't1', 0)
-  await say($, 'it still fails after 4 fixes')
-  await step($, 't2', 0)
-  expect(sent[1]?.model).toBe('opus')
-  expect(sent[1]?.effort).toBe('low')
+  expect(asked.length).toBe(1)
+  expect(sent[0]?.effort).toBe('xhigh')
+})
+
+test("a background task's notification after the question does not hide it", async ($, on) => {
+  const { sent, asked, rows } = engine(on)
+  asked_max(rows)
+  rows.push(
+    { role: 'user', text: '<task-notification><task-id>b1</task-id><status>completed</status></task-notification>' },
+    { role: 'assistant', text: 'The background build finished.' },
+  )
+  await say($, 'yes')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(0)
+  expect(sent[0]?.effort).toBe('max')
 })
 
 test('a yes in a relayed note does not answer the question', async ($, on) => {
@@ -403,15 +370,15 @@ test('#max runs max', async ($, on) => {
   expect(notes[0]).not.toContain('recommends')
 })
 
-test('after #max a long conversation keeps opus but does not stay on max', async ($, on) => {
-  const { sent, notes } = engine(on, '{"tier":"simple","why":"q"}', 150_000)
+test('after #max the next prompt does not stay on max', async ($, on) => {
+  const { sent, notes } = engine(on, '{"tier":"simple","why":"q"}')
   await say($, 'go deep #max')
   await step($, 't1', 0)
   await say($, 'and what about the logs?')
   await step($, 't2', 0)
   expect(sent[1]?.model).toBe('opus')
   expect(sent[1]?.effort).toBe('medium')
-  expect(notes[1]).not.toContain('#max')
+  expect(notes[1]).toContain('picked by classifier: q')
 })
 
 test("a #max that Claude wrote in a relayed note does not force max", async ($, on) => {
@@ -452,18 +419,6 @@ test('max never carries into a turn you did not start', async ($, on) => {
   await notify($, 'Background command finished with exit code 0')
   await step($, 't3', 0)
   expect(sent.map(s => s.effort)).toEqual(['max', 'xhigh', 'xhigh'])
-})
-
-test('a carried pick moves to opus once the conversation is long', async ($, on) => {
-  let tokens = 20_000
-  const { sent } = engine(on, '{"tier":"trivial","why":"thanks"}', () => tokens)
-  await say($, 'thanks!')
-  await step($, 't1', 0)
-  tokens = 150_000
-  await notify($, 'Background command finished with exit code 0')
-  await step($, 't2', 0)
-  expect(sent.map(s => s.model)).toEqual(['haiku', 'opus'])
-  expect(sent[1]?.effort).toBe('low')
 })
 
 test('a message that arrives mid-turn is told it applies from the next turn', async ($, on) => {

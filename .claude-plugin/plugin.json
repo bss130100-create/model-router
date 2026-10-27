@@ -1,7 +1,7 @@
 {
   "name": "model-router",
-  "version": "0.4.1",
-  "description": "Understands each prompt with a fast classifier model and picks the model and effort for it, from Haiku to Opus max",
+  "version": "0.5.0",
+  "description": "Understands each prompt with a fast classifier model and picks the effort for it on Opus, from low to max",
   "types": "./types/index.d.ts",
   "author": {
     "name": "Mihai"

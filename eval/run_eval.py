@@ -3,6 +3,7 @@
 Usage (from the repo root):  python3 eval/run_eval.py --cases <cases.json> [--runs 3]
 The cases are private conversation data and are not in this repo (format: sample-cases.json).
 Costs about $0.02 of Haiku per 3-run pass. Exits 1 if the pass rate drops below the floors.
+A max recommendation holds the work until the person answers, so one the case does not accept is a miss.
 Each prompt runs two ways: 'context' (the words plus earlier messages) and 'thread' (as a project
 thread delivers it: wake/relay XML, earlier messages wrapped, tool rows with no text in between)."""
 import argparse, collections, json, os, re, shutil, subprocess, sys, tempfile
@@ -46,7 +47,11 @@ def run_classifier(harness, jobs_path, out_path):
         raise RuntimeError(f'classifier run failed:\n{done.stdout}\n{done.stderr}')
 
 
-def verdict(tier, case):
+def verdict(tier, case, recommended=None):
+    # A recommendation starts no work: the turn only asks the person. Unless the case
+    # accepts the recommended tier, that stall is a miss, whatever tier would run after.
+    if recommended is not None and recommended not in case['ok']:
+        return 'stall'
     if tier in case['ok']:
         return 'ok'
     return 'over' if ORDER.index(tier) > ORDER.index(case['ideal']) else 'under'
@@ -60,8 +65,8 @@ def score(cases, results):
     tally = {m: collections.Counter() for m in FLOORS}
     misses = []
     for r in sorted(results, key=lambda r: (r['mode'], r['id'], r['run'])):
-        # Scored on the tier that runs; a capped pick also counts as a recommendation shown to the person.
-        v = verdict(r['tier'], by_case[r['id']])
+        # Scored on the tier that runs; a needless recommendation is scored as a stall.
+        v = verdict(r['tier'], by_case[r['id']], r.get('recommended'))
         tally[r['mode']][v] += 1
         tally[r['mode']]['recommended'] += r.get('recommended') is not None
         picked = r['tier'] if r['classified'] == r['tier'] else f"{r['classified']}->{r['tier']}"
@@ -86,11 +91,11 @@ def main():
     print('\n'.join(misses) or 'no misses')
     passed = True
     for mode, t in tally.items():
-        total = t['ok'] + t['over'] + t['under']
+        total = t['ok'] + t['over'] + t['under'] + t['stall']
         rate = t['ok'] / total
         passed &= rate >= FLOORS[mode]
         print(f"{mode:7} {t['ok']}/{total} in range ({rate:.0%}, floor {FLOORS[mode]:.0%}), too high {t['over']}, "
-              f"too low {t['under']}, max recommended {t['recommended']}")
+              f"too low {t['under']}, needless max stalls {t['stall']}, max recommended {t['recommended']}")
     sys.exit(0 if passed else 1)
 
 

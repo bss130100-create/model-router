@@ -1,6 +1,6 @@
 # model-router
 
-A Claude Code mod that picks the **model** and **effort level** for each prompt you send. A small, fast classifier model (Haiku) reads each prompt and picks a tier; you tune the tiers in one file.
+A Claude Code mod that picks the **effort level** for each prompt you send, always on Opus. A small, fast classifier model (Haiku) reads each prompt and picks a tier; you tune the tiers in one file.
 
 ## Install
 
@@ -26,19 +26,19 @@ line fails setup loudly if the wrong version got installed.
 
 ```
 set -e
-claude plugin marketplace add bss130100-create/model-router#release-0.4.1
+claude plugin marketplace add bss130100-create/model-router#release-0.5.0
 claude plugin install model-router@mihai-mods
-claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.4.1" || { echo "model-router: installed version is not 0.4.1" >&2; exit 1; }
+claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.5.0" || { echo "model-router: installed version is not 0.5.0" >&2; exit 1; }
 ```
 
-To update: push a `release-<version>` branch, then change both `0.4.1`s in the script.
+To update: push a `release-<version>` branch, then change both `0.5.0`s in the script.
 
 ## What it does
 
 1. Before each prompt runs, a small fast model (Haiku, low effort) reads your
    prompt plus the last 6 messages and picks a **tier**. Reading the context is
    what lets it understand short replies like "yes, do it".
-2. The tier decides the model and effort for every request of that turn.
+2. The tier decides the effort for every request of that turn, on Opus.
    The pick is locked for the whole turn, so a turn never switches model halfway.
    A message you type mid-turn is routed on the next turn.
 3. The status line shows the pick, for example `route: opus · xhigh (hard)`.
@@ -48,38 +48,38 @@ one: accuracy first, then cost. Subagents are left alone.
 
 ## Tiers
 
-| Tier | Model · effort | For |
+| Tier | Effort (all on opus) | For |
 | --- | --- | --- |
-| trivial | haiku · low | thanks, yes/no, status questions |
-| simple | sonnet · medium | explain a concept, small one-file edit |
-| standard | opus · high | normal feature work with tests |
-| hard | opus · xhigh | hard bugs, tricky design, multi-file refactor |
-| max | opus · max | stuck after several tries, deep root-cause hunt |
+| trivial | low | thanks, yes/no, status questions |
+| simple | medium | explain a concept, small one-file edit |
+| standard | high | normal feature work with tests |
+| hard | xhigh | hard bugs, tricky design, multi-file refactor, a big multi-feature build |
+| max | max | stuck on the same problem after several failed fixes |
+
+**Why one model.** Each model keeps its own prompt cache, so switching model
+re-reads the whole conversation at full price, and switching back does it
+again. An effort change keeps the cache. A Projects thread starts at about 77K
+tokens, so a switch to Haiku or Sonnet there costs more usage than it saves.
+So every tier runs on `MODEL` (opus) and only the effort changes: a "thanks"
+runs on Opus at low effort.
 
 **Max only with your yes.** The router picks up to `hard` on its own
 (`AUTO_TIER_CAP`). When the classifier says `max`, no work starts: Claude only
 replies "The router recommends max for this. Reply yes to run it at max, or no
-to run it at hard." That asking turn runs on the cheapest tier (in a long
-conversation, on opus at low effort). Your next message decides:
+to run it at hard." That asking turn runs at low effort. Your next message decides:
 
-- `yes` (or y, yeah, yep, yup, ok, okay, sure, go, do, proceed) runs the held request at max.
-- `no` (or n, nope, nah) runs it at hard.
+- A message that starts with `yes` (or y, yeah, yep, yup, ok, okay, sure, proceed) runs the held request at max.
+- A message made only of `go`, `do it`, `go ahead` or `go for it` is a yes too.
+- A message that starts with `no` (or n, nope, nah) runs it at hard.
 - Anything else is a new request: it is classified as usual and the held one is dropped.
+  That includes a message holding both ("ok wait, no") and "do it at hard instead".
 
-Only the first word counts, so "no, and also check the logs" is a no.
+So "no, and also check the logs" is a no, and "yes, and check the logs too" is a yes.
+A background task finishing in between does not cancel the question.
 
 Type `#trivial`, `#simple`, `#standard`, `#hard` or `#max` anywhere in a prompt
 to force a tier. A tag skips the classifier. Only tags in your own words count: a
 `#max` (or a yes) that Claude wrote, or that a colleague's note quotes, does not.
-
-**Long conversations.** Each model keeps its own prompt cache, so moving to a
-cheaper model in a long conversation re-reads everything at full price, and
-moving back does it again. An effort change keeps the cache. So above
-`LONG_CONTEXT_TOKENS` (50K) every tier runs on at least the standard tier's model
-(opus), while the effort still follows the tier: a "thanks" runs on Opus at low
-effort, not on Haiku. A #tag sets the tier the same way. The router reads the
-conversation's size from the session, so the rule holds after a restart or a
-resume.
 
 **Turns you did not start** (a background task finishing, a system event, a
 slash command) carry your last pick, but never max: max runs only for the
@@ -91,21 +91,19 @@ tool), and drops rows that are only tool calls before taking the last 6 messages
 as context. Background-task notifications and system
 events (a wake with no words from you and no note) carry the last pick instead of
 being routed again. A message that arrives while a turn runs is routed for the
-next turn; the running turn keeps its route. A thread is past 50K tokens from its
-first message, so there the router only ever changes the effort.
+next turn; the running turn keeps its route.
 
 ## Tuning it
 
-Everything lives in `hooks/rules.ts`: each tier's model, effort, and the plain
-English guide the classifier reads to recognise it, plus `AUTO_TIER_CAP` and
-`LONG_CONTEXT_TOKENS`. Change a guide to move a kind
-of request up or down a tier.
+Everything lives in `hooks/rules.ts`: the one `MODEL`, each tier's effort and the
+plain English guide the classifier reads to recognise it, plus `AUTO_TIER_CAP`.
+Change a guide to move a kind of request up or down a tier.
 
-If the classifier fails (timeout, API error, an answer it cannot read), the
-`ON_CLASSIFIER_ERROR` tier (standard) is used, and a toast and the status line
-say so. Your prompt is never blocked by the router.
+If the classifier fails (timeout, API error, or an answer that is not exactly one
+JSON object), the `ON_CLASSIFIER_ERROR` tier (standard) is used, and a toast, the
+status line and Claude's reply say so. Your prompt is never blocked by the router.
 
-A mistake in `rules.ts` (an unknown effort, a missing tier, an empty guide) stops
+A mistake in `rules.ts` (an empty model, an unknown effort, a missing tier, an empty guide) stops
 the mod from loading, and Claude Code shows the reason.
 
 ## Checking it
@@ -122,11 +120,10 @@ everywhere, including Projects threads where slash commands cannot run.
 
 ## Things to know
 
-- While it is on, the router overrides the model you picked with `/model`.
+- While it is on, the router overrides the model and effort you picked with
+  `/model` or a session setting. To change the effort, type a `#tag`.
 - Each prompt costs one small Haiku call (about a second). Slash commands skip it.
-- Switching model between turns re-reads the conversation without the prompt
-  cache, so a switch costs more on that turn. That is why, past
-  `LONG_CONTEXT_TOKENS`, every tier runs on at least opus.
+  That call is separate, so it never touches the conversation's prompt cache.
 
 ## Tests
 

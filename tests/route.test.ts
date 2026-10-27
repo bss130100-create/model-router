@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { AUTO_TIER_CAP, CLASSIFIER, LONG_CONTEXT_TOKENS, ON_CLASSIFIER_ERROR, TIERS } from '../hooks/rules'
+import { AUTO_TIER_CAP, CLASSIFIER, MODEL, ON_CLASSIFIER_ERROR, TIERS } from '../hooks/rules'
 import {
   answerHeld,
   buildClassifierRequest,
@@ -12,7 +12,6 @@ import {
   findHeldQuestion,
   findTag,
   heldQuestion,
-  floorModelInLongContext,
   holdForAnswer,
   parseClassifierReply,
   prepareClassifierInput,
@@ -42,14 +41,17 @@ describe('parseClassifierReply', () => {
       why: 'intermittent crash',
     })
   })
-  test('reads JSON wrapped in other text', async () => {
-    expect(parseClassifierReply('Sure: {"tier":"trivial","why":"thanks"} done').tier).toBe('trivial')
+  test('reads JSON in a code fence', async () => {
+    expect(parseClassifierReply('```json\n{"tier":"trivial","why":"thanks"}\n```').tier).toBe('trivial')
+  })
+  test('refuses JSON wrapped in other text, rather than guess which part is the answer', async () => {
+    expect(() => parseClassifierReply('Not {"tier":"max"} but {"tier":"trivial","why":"thanks"}')).toThrow(/not one JSON object/)
   })
   test('refuses an unknown tier', async () => {
     expect(() => parseClassifierReply('{"tier":"huge"}')).toThrow(/unknown tier: huge/)
   })
   test('refuses a reply with no JSON', async () => {
-    expect(() => parseClassifierReply('hard')).toThrow(/no JSON/)
+    expect(() => parseClassifierReply('hard')).toThrow(/not one JSON object/)
   })
   test('refuses broken JSON', async () => {
     expect(() => parseClassifierReply('{tier: hard}')).toThrow()
@@ -83,39 +85,39 @@ describe('buildClassifierRequest', () => {
 
 describe('validateConfig', () => {
   test('the shipped rules are valid', async () => {
-    validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)
+    validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)
   })
   test('an unknown effort is refused', async () => {
     const bad = { ...TIERS, hard: { ...TIERS.hard, effort: 'ultra' as never } }
-    expect(() => validateConfig(bad, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(/effort "ultra"/)
+    expect(() => validateConfig(bad, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(/effort "ultra"/)
   })
   test('a missing tier is refused', async () => {
     const { max: _, ...rest } = TIERS
-    expect(() => validateConfig(rest as typeof TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(
+    expect(() => validateConfig(rest as typeof TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(
       /missing "max"/,
     )
   })
   test('an empty guide is refused', async () => {
     const bad = { ...TIERS, simple: { ...TIERS.simple, guide: ' ' } }
-    expect(() => validateConfig(bad, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(/empty guide/)
+    expect(() => validateConfig(bad, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(/empty guide/)
   })
   test('a bad timeout is refused', async () => {
-    expect(() => validateConfig(TIERS, { ...CLASSIFIER, timeoutMs: 0 }, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(
+    expect(() => validateConfig(TIERS, MODEL, { ...CLASSIFIER, timeoutMs: 0 }, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(
       /timeoutMs/,
     )
   })
   test('an error tier that does not exist is refused', async () => {
-    expect(() => validateConfig(TIERS, CLASSIFIER, 'medium' as never, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)).toThrow(/not a tier/)
+    expect(() => validateConfig(TIERS, MODEL, CLASSIFIER, 'medium' as never, AUTO_TIER_CAP)).toThrow(/not a tier/)
   })
 })
 
 test('describeRouter lists every tier and the classifier', async () => {
-  const text = describeRouter(false, null, TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, AUTO_TIER_CAP)
+  const text = describeRouter(false, null, TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)
   expect(text).toContain('Model router is ON')
-  expect(text).toContain('trivial -> haiku · low')
-  expect(text).toContain('max -> opus · max')
+  expect(text).toContain('Every tier runs on opus')
+  expect(text).toContain('trivial -> low')
+  expect(text).toContain('max -> max')
   expect(text).toContain('Classifier: haiku · low')
-  expect(text).toContain('Above 50K tokens of context every tier runs on at least opus')
   expect(text).toContain('For a higher tier it asks first: yes runs it, no runs hard.')
 })
 
@@ -154,6 +156,15 @@ describe('unwrap', () => {
     expect(unwrap(RELAY)).toEqual({ words: 'build the HUD export', notes: ['He wants CSV and PDF. #max'] })
   })
 
+  test("a background task's notification and a reminder are not the person's words", async () => {
+    expect(unwrap('<task-notification><status>completed</status> #max</task-notification>')).toEqual({ words: '', notes: [] })
+    expect(extractRequest('<system-reminder>\n<task-notification>done</task-notification>\n</system-reminder>\n')).toBe('')
+  })
+
+  test('a reminder before a wake leaves the wake', async () => {
+    expect(unwrap(`<system-reminder>note</system-reminder>\n${WAKE}`)).toEqual({ words: "it's live", notes: [] })
+  })
+
   test("a #max that Claude wrote is not the person's tag", async () => {
     expect(findTag(unwrap(RELAY).words)).toBe(null)
     expect(findTag(unwrap(WAKE).words)).toBe(null)
@@ -185,37 +196,11 @@ describe('extractRequest', () => {
   })
 })
 
-describe('floorModelInLongContext', () => {
-  const simple = decide('simple', 'classifier', 'question', TIERS)
-  const trivial = decide('trivial', 'tag', '#trivial tag', TIERS)
-
-  test('a short conversation follows the pick', async () => {
-    expect(floorModelInLongContext(simple, 50_000, 100_000, TIERS)).toBe(simple)
-  })
-
-  test("a long conversation runs a cheaper tier on the standard tier's model, at the tier's effort", async () => {
-    expect(floorModelInLongContext(simple, 150_000, 100_000, TIERS)).toEqual({
-      ...simple,
-      model: 'opus',
-      why: 'question; on opus, not sonnet: context 150K tokens',
-    })
-  })
-
-  test('a #tag keeps its tier and source, only the model is kept', async () => {
-    const kept = floorModelInLongContext(trivial, 150_000, 100_000, TIERS)
-    expect(kept.model).toBe('opus')
-    expect(kept.effort).toBe('low')
-    expect(kept.source).toBe('tag')
-  })
-
-  test('a recommendation is kept, so the router still asks first', async () => {
-    const held = { ...trivial, recommended: 'max' as const }
-    expect(floorModelInLongContext(held, 150_000, 100_000, TIERS).recommended).toBe('max')
-  })
-
-  test('the standard model and stronger ones stand', async () => {
-    const hard = decide('hard', 'classifier', 'bug', TIERS)
-    expect(floorModelInLongContext(hard, 150_000, 100_000, TIERS)).toBe(hard)
+describe('decide', () => {
+  test('every tier runs on the one model; only the effort changes', async () => {
+    const routes = (['trivial', 'simple', 'standard', 'hard', 'max'] as const).map(t => decide(t, 'classifier', '', TIERS))
+    expect(routes.map(r => r.model)).toEqual(['opus', 'opus', 'opus', 'opus', 'opus'])
+    expect(routes.map(r => r.effort)).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
   })
 })
 
@@ -233,8 +218,8 @@ describe('carryPick', () => {
   })
 })
 
-test('a bad LONG_CONTEXT_TOKENS is refused', async () => {
-  expect(() => validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, 0, AUTO_TIER_CAP)).toThrow(/LONG_CONTEXT_TOKENS/)
+test('an empty MODEL is refused', async () => {
+  expect(() => validateConfig(TIERS, ' ', CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(/MODEL is empty/)
 })
 
 describe('prepareClassifierInput', () => {
@@ -312,13 +297,13 @@ describe('holdForAnswer', () => {
     expect(holdForAnswer(hard, TIERS)).toBe(hard)
   })
 
-  test('a recommendation runs the cheapest tier, since the turn only asks', async () => {
+  test('a recommendation runs the lowest effort, since the turn only asks', async () => {
     const held = holdForAnswer(capAutoTier(decide('max', 'classifier', 'stuck', TIERS), 'hard', TIERS), TIERS)
     expect(held).toEqual({
       tier: 'trivial',
       source: 'classifier',
       why: 'stuck',
-      model: 'haiku',
+      model: 'opus',
       effort: 'low',
       recommended: 'max',
     })
@@ -326,15 +311,27 @@ describe('holdForAnswer', () => {
 })
 
 describe('readAnswer', () => {
-  test('reads yes from the first word', async () => {
+  test('a message that opens with a yes word is a yes', async () => {
     expect(readAnswer('Yes!')).toBe('yes')
     expect(readAnswer('  ok go ahead')).toBe('yes')
     expect(readAnswer('y')).toBe('yes')
-    expect(readAnswer('do it')).toBe('yes')
+    expect(readAnswer('yes, and check the logs too')).toBe('yes')
   })
-  test('reads no from the first word', async () => {
+  test('"go" and "do" are a yes only in a message made of nothing else', async () => {
+    expect(readAnswer('do it')).toBe('yes')
+    expect(readAnswer('Go!')).toBe('yes')
+    expect(readAnswer('go for it')).toBe('yes')
+    expect(readAnswer('do it at hard instead')).toBe(null)
+    expect(readAnswer('do you think the cache is the cause?')).toBe(null)
+    expect(readAnswer('go check the logs first')).toBe(null)
+  })
+  test('a message that opens with a no word is a no', async () => {
     expect(readAnswer('no, hard is fine')).toBe('no')
     expect(readAnswer('Nope')).toBe('no')
+  })
+  test('a message that holds both is not an answer', async () => {
+    expect(readAnswer('ok wait, no')).toBe(null)
+    expect(readAnswer('no wait, yes')).toBe(null)
   })
   test('anything else is not an answer', async () => {
     expect(readAnswer('nothing works still')).toBe(null)
@@ -371,6 +368,17 @@ describe('findHeldQuestion', () => {
       { role: 'assistant' as const, text: 'It says timeout.' },
     ]
     expect(findHeldQuestion(rows)).toBe(null)
+  })
+
+  test("a background task's notification after the question is not the person writing", async () => {
+    const rows = [
+      { role: 'user' as const, text: 'stuck on the freeze' },
+      { role: 'assistant' as const, text: ask },
+      { role: 'user' as const, text: '<task-notification><task-id>b1</task-id><status>completed</status></task-notification>' },
+      { role: 'user' as const, text: '<system-reminder>\n<task-notification>done</task-notification>\n</system-reminder>' },
+      { role: 'assistant' as const, text: 'The build finished.' },
+    ]
+    expect(findHeldQuestion(rows)).toEqual({ recommended: 'max', cap: 'hard' })
   })
 
   test('null when the line names no real tier', async () => {
@@ -419,22 +427,29 @@ describe('routeNote', () => {
     )
   })
 
-  test('no recommendation: mention the route only when asked', async () => {
-    expect(routeNote(decide('simple', 'classifier', 'q', TIERS), false, 'hard')).toContain(
-      'Mention it only if the user asks',
-    )
+  test('no recommendation: mention the route only when asked, and change effort with a #tag', async () => {
+    const note = routeNote(decide('simple', 'classifier', 'q', TIERS), false, 'hard')
+    expect(note).toContain('Mention it only if the user asks')
+    expect(note).toContain('the user types #trivial, #simple, #standard, #hard or #max')
+  })
+
+  test('a classifier failure is told to the user, never silent', async () => {
+    const note = routeNote(decide('standard', 'error', 'api-error', TIERS), false, 'hard')
+    expect(note).toContain('picked by error: api-error')
+    expect(note).toContain("The router's classifier failed")
+    expect(note).toContain('tell the user so in one short line')
   })
 
   test('a message that arrives mid-turn is routed for the next turn', async () => {
     const note = routeNote(decide('simple', 'classifier', 'q', TIERS), true, 'hard')
-    expect(note).toContain('The router picked sonnet at medium effort (tier simple, picked by classifier: q) for this message.')
+    expect(note).toContain('The router picked opus at medium effort (tier simple, picked by classifier: q) for this message.')
     expect(note).toContain('The turn already running keeps its route; the pick applies from the next turn.')
     expect(note).not.toContain('This turn runs on')
   })
 })
 
 test('an AUTO_TIER_CAP that is not a tier is refused', async () => {
-  expect(() => validateConfig(TIERS, CLASSIFIER, ON_CLASSIFIER_ERROR, LONG_CONTEXT_TOKENS, 'huge' as never)).toThrow(
+  expect(() => validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, 'huge' as never)).toThrow(
     /AUTO_TIER_CAP/,
   )
 })

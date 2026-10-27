@@ -6,8 +6,8 @@ export type ModelRouterTier = 'trivial' | 'simple' | 'standard' | 'hard' | 'max'
 /** A model alias (opus, sonnet, haiku) or a full model id, plus an effort level. */
 export type ModelRouterRoute = { model: string; effort: ModelRouterEffort }
 
-/** One tier: the route it sends, and the guide the classifier reads to pick it. */
-export type ModelRouterTierSpec = ModelRouterRoute & { guide: string }
+/** One tier: its effort (every tier runs on the router's one model), and the guide the classifier reads to pick it. */
+export type ModelRouterTierSpec = { effort: ModelRouterEffort; guide: string }
 
 /** The model that reads each prompt and picks a tier. */
 export type ModelRouterClassifier = {
@@ -21,8 +21,7 @@ export type ModelRouterClassifier = {
 /**
  * What the router picked for a prompt and why. `source` says who picked the
  * tier: a #tag you typed, the classifier, the declared error tier, or your
- * yes or no to a recommendation. In a long conversation `why` also says when
- * the model was kept at the standard tier's.
+ * yes or no to a recommendation.
  */
 export type ModelRouterDecision = ModelRouterRoute & {
   tier: ModelRouterTier

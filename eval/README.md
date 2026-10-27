@@ -24,17 +24,20 @@ The run copies `hooks/route.ts`, `hooks/rules.ts` and `types/` into a throwaway 
 `prepareClassifierInput`, `buildClassifierRequest` and `$.model.complete` exactly as the router does.
 A run is scored on the tier that does the work by default: when the classifier says a tier above
 `AUTO_TIER_CAP`, the router asks first and runs the cap unless the person says yes, so the eval
-scores the cap and counts the question separately. It exits 1 when either mode falls below its floor (95% context,
+scores the cap. But the asking turn does no work, so a recommendation the case does not accept is
+scored as a miss (a "needless max stall"), whatever tier would run after. It exits 1 when either mode falls below its floor (95% context,
 90% thread). Every miss is printed with the classifier's reason.
 
 A label may change only for a reason that doesn't depend on what the classifier picked, and the case
 then carries a `label_note` saying why.
 
-Results on 26 Oct 2026:
+Results (0.4.1 and 0.5.0 on 27 Oct 2026):
 
 | version | runs | context | thread | max recommended |
 | --- | --- | --- | --- | --- |
 | 0.2.1 | 3 | 98/99 | 62/72 (6 too high, 4 too low) | n/a (max ran) |
 | 0.3.0 | 5 | 164/165 | 120/120 | 5 |
+| 0.4.1 | 5 | 165/165 | 109/120 (4 too high, 7 needless max stalls) | 7 |
+| 0.5.0 | 5 | 163/165 (2 too high) | 118/120 (2 too high), 0 stalls | 0 |
 
 0.2.1's thread runs had no context, since that version saw none in a thread.

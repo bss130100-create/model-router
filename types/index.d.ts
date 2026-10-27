@@ -19,14 +19,14 @@ export type ModelRouterClassifier = {
 }
 
 /**
- * What the router picked for a prompt and why. `source` says who picked:
- * a #tag you typed, the classifier, the declared error tier, the
- * long-context rule that kept a higher tier, or your yes or no to a
- * recommendation.
+ * What the router picked for a prompt and why. `source` says who picked the
+ * tier: a #tag you typed, the classifier, the declared error tier, or your
+ * yes or no to a recommendation. In a long conversation `why` also says when
+ * the model was kept at the standard tier's.
  */
 export type ModelRouterDecision = ModelRouterRoute & {
   tier: ModelRouterTier
-  source: 'tag' | 'classifier' | 'error' | 'long-context' | 'answer'
+  source: 'tag' | 'classifier' | 'error' | 'answer'
   why: string
   /**
    * A higher tier the router recommends. While set, the work waits: the turn
@@ -44,8 +44,6 @@ declare module 'claude-code' {
       last: Shaped<ModelRouterDecision | null>
       lock: Shaped<ModelRouterTurnLock | null>
       isOff: boolean
-      /** How many tokens the last main-loop request carried. */
-      contextTokens: number
     }
   }
 }

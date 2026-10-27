@@ -68,11 +68,12 @@ export const AUTO_TIER_CAP: ModelRouterTier = 'hard'
 
 // In a long conversation, switching to a cheaper model costs MORE than it
 // saves: each model keeps its own prompt cache, so the first turn on the new
-// model re-reads the whole conversation at full price. Above this many tokens
-// the router never switches to a cheaper model than the one that ran last;
-// effort still follows the tier (an effort change keeps the cache). A #tag
-// still forces any tier. 50K: a Projects thread is past it from its first
-// prompt (~77K), so there the model only ever moves up after the first turn.
+// model re-reads the whole conversation at full price, and so does the turn
+// that goes back. Above this many tokens every tier runs on at least the
+// standard tier's model (opus); effort still follows the tier (an effort
+// change keeps the cache), so a "thanks" runs on opus at low effort. #tags
+// follow the same rule. 50K: a Projects thread is past it from its first
+// prompt (~77K), so there the router only ever changes the effort.
 export const LONG_CONTEXT_TOKENS = 50_000
 
 // If the classifier fails (timeout, API error, unreadable answer) this tier is

@@ -7,13 +7,14 @@ import {
   answerHeld,
   buildClassifierRequest,
   capAutoTier,
+  carryPick,
   decide,
   describeRouter,
   extractRequest,
   findHeldQuestion,
   findTag,
+  floorModelInLongContext,
   holdForAnswer,
-  keepStrongerModelInLongContext,
   label,
   parseClassifierReply,
   prepareClassifierInput,
@@ -27,13 +28,12 @@ import type { SessionRow } from './route'
 // Change a shape tag when that value's fields change: it declines what an
 // earlier version stored, which outlives a reload.
 const last = atom({ plugin: 'model-router', key: 'last' } as const, null as ModelRouterDecision | null, {
-  shape: 'decision-4',
+  shape: 'decision-5',
 })
 const lock = atom({ plugin: 'model-router', key: 'lock' } as const, null as ModelRouterTurnLock | null, {
-  shape: 'lock-4',
+  shape: 'lock-5',
 })
 const isOff = atom({ plugin: 'model-router', key: 'isOff' } as const, false)
-const contextTokens = atom({ plugin: 'model-router', key: 'contextTokens' } as const, 0)
 
 /** Asks the classifier model which tier the prompt needs. */
 async function classify(
@@ -62,30 +62,27 @@ async function classify(
   }
 }
 
-/**
- * The classifier's tier with the cost rules applied: above AUTO_TIER_CAP the
- * work waits for the person's yes or no, and in a long conversation never a
- * cheaper model than the route that ran last.
- */
+/** The classifier's tier; above AUTO_TIER_CAP the work waits for the person's yes or no. */
 async function pick($: EngineInterface, text: string, rows: readonly SessionRow[]): Promise<ModelRouterDecision> {
-  const held = holdForAnswer(capAutoTier(await classify($, text, rows), AUTO_TIER_CAP, TIERS), TIERS)
-  const ran = await read($, lock)
-  return keepStrongerModelInLongContext(
-    held,
-    ran === null ? null : ran.decision,
-    await read($, contextTokens),
-    LONG_CONTEXT_TOKENS,
-    TIERS,
-  )
+  return holdForAnswer(capAutoTier(await classify($, text, rows), AUTO_TIER_CAP, TIERS), TIERS)
 }
 
 /**
- * The route for a prompt. Only the person's own words can force a tier or
+ * How many tokens the conversation holds: what the last response was
+ * answered over, which the session keeps across a restart or a resume.
+ * Absent before the first response, when the conversation is new.
+ */
+async function contextSize($: EngineInterface): Promise<number> {
+  return (await $.session.usage()).context.tokens ?? 0
+}
+
+/**
+ * The tier for a prompt. Only the person's own words can force a tier or
  * answer the router's question: a #max or "yes" that Claude wrote, relayed or
  * quoted in a note, must not. A #tag wins, then a yes or no to the question
  * Claude last asked (read from the transcript), then the classifier.
  */
-async function choose($: EngineInterface, text: string): Promise<ModelRouterDecision> {
+async function chooseTier($: EngineInterface, text: string): Promise<ModelRouterDecision> {
   const words = unwrap(text).words
   const tag = findTag(words)
   if (tag !== null) {
@@ -98,6 +95,27 @@ async function choose($: EngineInterface, text: string): Promise<ModelRouterDeci
     return answerHeld(held.recommended, answer, held.cap, TIERS)
   }
   return pick($, text, rows)
+}
+
+/** The route for a prompt: its tier, on at least the standard model in a long conversation. */
+async function choose($: EngineInterface, text: string): Promise<ModelRouterDecision> {
+  const tier = await chooseTier($, text)
+  return floorModelInLongContext(tier, await contextSize($), LONG_CONTEXT_TOKENS, TIERS)
+}
+
+/**
+ * The route a turn the person did not start carries: their last pick, never
+ * above AUTO_TIER_CAP, and on at least the standard model in a long
+ * conversation (it may have grown past the limit since).
+ */
+async function carry($: EngineInterface): Promise<void> {
+  const tokens = await contextSize($)
+  const carried = await update($, last, d =>
+    d === null ? null : floorModelInLongContext(carryPick(d, AUTO_TIER_CAP, TIERS), tokens, LONG_CONTEXT_TOKENS, TIERS),
+  )
+  if (carried !== null) {
+    $.ui.status(label(carried))
+  }
 }
 
 /** The declared error tier, said out loud: never a silent fallback. */
@@ -137,14 +155,15 @@ export const register: Register = on => {
 
   // 1. Understand each prompt you send and pick a tier.
   // Slash commands, background-task notifications and system events (a
-  // wrapped prompt with neither the person's words nor a note) keep the last pick.
+  // wrapped prompt with neither the person's words nor a note) carry the last pick.
   on('prompt.submit', async ($, e, next) => {
-    const isSkipped =
-      e.command !== undefined ||
-      e.origin.kind === 'task-notification' ||
-      extractRequest(e.text).trim() === '' ||
-      (await read($, isOff))
-    if (isSkipped) {
+    if (await read($, isOff)) {
+      return next(e)
+    }
+    const isYours =
+      e.command === undefined && e.origin.kind !== 'task-notification' && extractRequest(e.text).trim() !== ''
+    if (!isYours) {
+      await carry($)
       return next(e)
     }
     const decision = await choose($, e.text)
@@ -168,15 +187,7 @@ export const register: Register = on => {
     if (e.agentId !== undefined) {
       return yield* next(e)
     }
-    const routed = await routeStep($, e)
-    const result = yield* next(routed)
-    // 3. Remember how big the conversation is, for the long-context rule.
-    if (result.usage !== null) {
-      const u = result.usage
-      const size = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
-      await update($, contextTokens, () => size)
-    }
-    return result
+    return yield* next(await routeStep($, e))
   })
 
   on('command.run', { command: 'route' }, async ($, e) => {

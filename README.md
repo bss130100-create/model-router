@@ -26,12 +26,12 @@ line fails setup loudly if the wrong version got installed.
 
 ```
 set -e
-claude plugin marketplace add bss130100-create/model-router#release-0.4.0
+claude plugin marketplace add bss130100-create/model-router#release-0.4.1
 claude plugin install model-router@mihai-mods
-claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.4.0" || { echo "model-router: installed version is not 0.4.0" >&2; exit 1; }
+claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.4.1" || { echo "model-router: installed version is not 0.4.1" >&2; exit 1; }
 ```
 
-To update: push a `release-<version>` branch, then change both `0.4.0`s in the script.
+To update: push a `release-<version>` branch, then change both `0.4.1`s in the script.
 
 ## What it does
 
@@ -60,9 +60,9 @@ one: accuracy first, then cost. Subagents are left alone.
 (`AUTO_TIER_CAP`). When the classifier says `max`, no work starts: Claude only
 replies "The router recommends max for this. Reply yes to run it at max, or no
 to run it at hard." That asking turn runs on the cheapest tier (in a long
-conversation, on the same model at low effort). Your next message decides:
+conversation, on opus at low effort). Your next message decides:
 
-- `yes` (or y, yeah, yep, ok, okay, sure, go) runs the held request at max.
+- `yes` (or y, yeah, yep, yup, ok, okay, sure, go, do, proceed) runs the held request at max.
 - `no` (or n, nope, nah) runs it at hard.
 - Anything else is a new request: it is classified as usual and the held one is dropped.
 
@@ -73,19 +73,26 @@ to force a tier. A tag skips the classifier. Only tags in your own words count: 
 `#max` (or a yes) that Claude wrote, or that a colleague's note quotes, does not.
 
 **Long conversations.** Each model keeps its own prompt cache, so moving to a
-cheaper model in a long conversation re-reads everything at full price and costs
-more than it saves. An effort change keeps the cache. So above
-`LONG_CONTEXT_TOKENS` (50K) the router never switches to a cheaper model than the
-one that ran last, while the effort still follows the new tier: a "thanks" after
-hard work runs on Opus at low effort, not on Haiku. A #tag still forces any tier.
+cheaper model in a long conversation re-reads everything at full price, and
+moving back does it again. An effort change keeps the cache. So above
+`LONG_CONTEXT_TOKENS` (50K) every tier runs on at least the standard tier's model
+(opus), while the effort still follows the tier: a "thanks" runs on Opus at low
+effort, not on Haiku. A #tag sets the tier the same way. The router reads the
+conversation's size from the session, so the rule holds after a restart or a
+resume.
+
+**Turns you did not start** (a background task finishing, a system event, a
+slash command) carry your last pick, but never max: max runs only for the
+request you said yes to (or tagged #max).
 
 **Projects threads.** Messages there arrive wrapped in XML; the router reads only
 your words (plus a colleague's note) and Claude's replies (sent through its reply
 tool), and drops rows that are only tool calls before taking the last 6 messages
 as context. Background-task notifications and system
-events (a wake with no words from you and no note) keep the last pick instead of
+events (a wake with no words from you and no note) carry the last pick instead of
 being routed again. A message that arrives while a turn runs is routed for the
-next turn; the running turn keeps its route.
+next turn; the running turn keeps its route. A thread is past 50K tokens from its
+first message, so there the router only ever changes the effort.
 
 ## Tuning it
 
@@ -119,7 +126,7 @@ everywhere, including Projects threads where slash commands cannot run.
 - Each prompt costs one small Haiku call (about a second). Slash commands skip it.
 - Switching model between turns re-reads the conversation without the prompt
   cache, so a switch costs more on that turn. That is why, past
-  `LONG_CONTEXT_TOKENS`, the router never switches to a cheaper model.
+  `LONG_CONTEXT_TOKENS`, every tier runs on at least opus.
 
 ## Tests
 

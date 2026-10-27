@@ -137,32 +137,25 @@ function modelRank(model: string, tiers: Tiers): number {
 }
 
 /**
- * In a long conversation never switch to a cheaper model: each model has its
- * own prompt cache, so the first turn on the cheaper one re-reads the whole
- * conversation at full price and costs more than it saves. The new pick keeps
- * its tier, effort and recommendation; only the model stays. An effort change
- * keeps the cache, and a stronger model is always allowed.
+ * In a long conversation every tier runs on at least the model normal work
+ * runs on (the standard tier's). Each model keeps its own prompt cache, so a
+ * turn on a cheaper model re-reads the whole conversation at full price, and
+ * so does the turn that goes back. An effort change keeps the cache, so the
+ * tier's effort still applies, and a stronger model is allowed. The context
+ * size comes from the session, so a restart cannot lose the rule.
  */
-export function keepStrongerModelInLongContext(
-  next: ModelRouterDecision,
-  previous: ModelRouterDecision | null,
+export function floorModelInLongContext(
+  d: ModelRouterDecision,
   contextTokens: number,
   limit: number,
   tiers: Tiers,
 ): ModelRouterDecision {
-  if (previous === null || contextTokens <= limit) {
-    return next
+  const floor = tiers.standard.model
+  if (contextTokens <= limit || modelRank(d.model, tiers) >= modelRank(floor, tiers)) {
+    return d
   }
-  if (modelRank(next.model, tiers) >= modelRank(previous.model, tiers)) {
-    return next
-  }
-  const k = Math.round(contextTokens / 1000)
-  return {
-    ...next,
-    model: previous.model,
-    source: 'long-context',
-    why: `${next.tier} on ${previous.model}, not ${next.model}: context ${k}K tokens`,
-  }
+  const kept = `on ${floor}, not ${d.model}: context ${Math.round(contextTokens / 1000)}K tokens`
+  return { ...d, model: floor, why: d.why === '' ? kept : `${d.why}; ${kept}` }
 }
 
 /**
@@ -174,6 +167,19 @@ export function capAutoTier(d: ModelRouterDecision, cap: ModelRouterTier, tiers:
     return d
   }
   return { ...decide(cap, d.source, d.why, tiers), recommended: d.tier }
+}
+
+/**
+ * The pick a turn the person did not start (a background task's
+ * notification, a system event, a slash command) carries from their last
+ * prompt: the same tier, but never above the cap, so max runs only for the
+ * request it was asked for.
+ */
+export function carryPick(d: ModelRouterDecision, cap: ModelRouterTier, tiers: Tiers): ModelRouterDecision {
+  if (TIER_ORDER.indexOf(d.tier) <= TIER_ORDER.indexOf(cap)) {
+    return d
+  }
+  return decide(cap, d.source, d.why, tiers)
 }
 
 /**
@@ -409,7 +415,7 @@ export function describeRouter(
     `Classifier: ${classifier.model} · ${classifier.effort}, reads the last ${classifier.contextMessages} messages.`,
     `If it fails: ${onError}.`,
     `It picks up to ${autoTierCap} on its own. For a higher tier it asks first: yes runs it, no runs ${autoTierCap}.`,
-    `Above ${Math.round(longContextTokens / 1000)}K tokens of context it never switches to a cheaper model; effort still follows the tier.`,
+    `Above ${Math.round(longContextTokens / 1000)}K tokens of context every tier runs on at least ${tiers.standard.model}; effort still follows the tier.`,
     '',
     'Edit hooks/rules.ts to change them. /route off or /route on to switch.',
   ].join('\n')

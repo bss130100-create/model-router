@@ -5,14 +5,15 @@ import {
   answerHeld,
   buildClassifierRequest,
   capAutoTier,
+  carryPick,
   decide,
   describeRouter,
   extractRequest,
   findHeldQuestion,
   findTag,
   heldQuestion,
+  floorModelInLongContext,
   holdForAnswer,
-  keepStrongerModelInLongContext,
   parseClassifierReply,
   prepareClassifierInput,
   readAnswer,
@@ -114,7 +115,7 @@ test('describeRouter lists every tier and the classifier', async () => {
   expect(text).toContain('trivial -> haiku · low')
   expect(text).toContain('max -> opus · max')
   expect(text).toContain('Classifier: haiku · low')
-  expect(text).toContain('Above 50K tokens of context it never switches to a cheaper model')
+  expect(text).toContain('Above 50K tokens of context every tier runs on at least opus')
   expect(text).toContain('For a higher tier it asks first: yes runs it, no runs hard.')
 })
 
@@ -184,49 +185,51 @@ describe('extractRequest', () => {
   })
 })
 
-describe('keepStrongerModelInLongContext', () => {
-  const hard = decide('hard', 'classifier', 'bug', TIERS)
-  const max = decide('max', 'tag', '#max tag', TIERS)
+describe('floorModelInLongContext', () => {
   const simple = decide('simple', 'classifier', 'question', TIERS)
-  const trivial = decide('trivial', 'classifier', 'thanks', TIERS)
+  const trivial = decide('trivial', 'tag', '#trivial tag', TIERS)
 
-  test('a short conversation follows the new pick', async () => {
-    expect(keepStrongerModelInLongContext(simple, hard, 50_000, 100_000, TIERS)).toBe(simple)
+  test('a short conversation follows the pick', async () => {
+    expect(floorModelInLongContext(simple, 50_000, 100_000, TIERS)).toBe(simple)
   })
 
-  test('a long conversation keeps the stronger model but takes the new effort', async () => {
-    expect(keepStrongerModelInLongContext(simple, hard, 150_000, 100_000, TIERS)).toEqual({
+  test("a long conversation runs a cheaper tier on the standard tier's model, at the tier's effort", async () => {
+    expect(floorModelInLongContext(simple, 150_000, 100_000, TIERS)).toEqual({
       ...simple,
       model: 'opus',
-      effort: 'medium',
-      source: 'long-context',
-      why: 'simple on opus, not sonnet: context 150K tokens',
+      why: 'question; on opus, not sonnet: context 150K tokens',
     })
   })
 
-  test('after #max the next pick does not stay on max', async () => {
-    const kept = keepStrongerModelInLongContext(trivial, max, 150_000, 100_000, TIERS)
+  test('a #tag keeps its tier and source, only the model is kept', async () => {
+    const kept = floorModelInLongContext(trivial, 150_000, 100_000, TIERS)
     expect(kept.model).toBe('opus')
     expect(kept.effort).toBe('low')
-    expect(kept.tier).toBe('trivial')
+    expect(kept.source).toBe('tag')
   })
 
-  test('a recommendation is never carried over from an earlier turn', async () => {
-    const recommended = { ...hard, recommended: 'max' as const }
-    expect(keepStrongerModelInLongContext(simple, recommended, 150_000, 100_000, TIERS).recommended).toBe(null)
+  test('a recommendation is kept, so the router still asks first', async () => {
+    const held = { ...trivial, recommended: 'max' as const }
+    expect(floorModelInLongContext(held, 150_000, 100_000, TIERS).recommended).toBe('max')
   })
 
-  test('the same model keeps the new pick as it is', async () => {
-    const standard = decide('standard', 'classifier', 'feature', TIERS)
-    expect(keepStrongerModelInLongContext(standard, hard, 150_000, 100_000, TIERS)).toBe(standard)
+  test('the standard model and stronger ones stand', async () => {
+    const hard = decide('hard', 'classifier', 'bug', TIERS)
+    expect(floorModelInLongContext(hard, 150_000, 100_000, TIERS)).toBe(hard)
+  })
+})
+
+describe('carryPick', () => {
+  test('a pick at or below the cap carries as it is', async () => {
+    const hard = decide('hard', 'classifier', 'bug', TIERS)
+    expect(carryPick(hard, 'hard', TIERS)).toBe(hard)
   })
 
-  test('a long conversation still moves to a stronger model', async () => {
-    expect(keepStrongerModelInLongContext(hard, simple, 150_000, 100_000, TIERS)).toBe(hard)
-  })
-
-  test('with no earlier route the new one stands', async () => {
-    expect(keepStrongerModelInLongContext(simple, null, 150_000, 100_000, TIERS)).toBe(simple)
+  test('max never carries: it drops to the cap', async () => {
+    const carried = carryPick(decide('max', 'tag', '#max tag', TIERS), 'hard', TIERS)
+    expect(carried.tier).toBe('hard')
+    expect(carried.effort).toBe('xhigh')
+    expect(carried.recommended).toBe(null)
   })
 })
 

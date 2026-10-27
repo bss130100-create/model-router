@@ -13,8 +13,9 @@ const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, c
 function engine(
   on: On,
   reply: string | readonly string[] | 'api-error' = '{"tier":"standard","why":"x"}',
-  contextTokens = 1000,
+  contextTokens: number | (() => number) = 1000,
 ) {
+  const size = typeof contextTokens === 'number' ? () => contextTokens : contextTokens
   const sent: TurnStepInput[] = []
   const asked: ModelCompleteRequest[] = []
   const rows: SessionRow[] = []
@@ -25,6 +26,10 @@ function engine(
     return { text: e.text }
   })
   on('ui.toast', () => ({ value: undefined }))
+  // What the session reports as the conversation's size; a restart keeps it.
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { tokens: size(), window: 1_000_000 }, rateLimits: [] },
+  }))
   on('session.messages', () => ({
     value: [
       { role: 'user', text: 'Can you plan a rewrite of the scanner?', toolUses: [] },
@@ -54,7 +59,7 @@ function engine(
       answer: '',
       toolUses: [],
       stopReason: 'end_turn',
-      usage: { ...USAGE, cache_read_input_tokens: contextTokens, model: e.model },
+      usage: { ...USAGE, cache_read_input_tokens: size(), model: e.model },
     }
   })
   return { sent, asked, notes, rows }
@@ -227,7 +232,7 @@ test('a project-thread wake is classified on the words alone', async ($, on) => 
   expect(prompt).not.toContain('system-note')
 })
 
-test('a background-task notification keeps the last pick', async ($, on) => {
+test('a background-task notification carries the last pick', async ($, on) => {
   const { sent, asked } = engine(on, '{"tier":"hard","why":"bug"}')
   await say($, 'the app crashes')
   await notify($, 'Background command finished with exit code 0')
@@ -246,16 +251,43 @@ test('in a long conversation the model stays but the effort follows the new tier
   expect(sent[1]?.model).toBe('opus')
   expect(sent[1]?.effort).toBe('low')
   const shown = await route($, '')
-  expect(shown.text).toContain('by long-context: trivial on opus, not haiku: context 150K tokens')
+  expect(shown.text).toContain('by classifier: thanks; on opus, not haiku: context 150K tokens')
 })
 
-test('in a long conversation a #tag still forces a lower tier', async ($, on) => {
+test('in a long conversation the rule holds after a restart, with no earlier turn in memory', async ($, on) => {
+  // A fresh process on a resumed 150K-token thread: only the session knows its size.
+  const { sent } = engine(on, '{"tier":"trivial","why":"status question"}', 150_000)
+  await say($, 'what route are you on?')
+  await step($, 't1', 0)
+  expect(sent[0]?.model).toBe('opus')
+  expect(sent[0]?.effort).toBe('low')
+})
+
+test('in a long conversation a cheap pick never starts another cache', async ($, on) => {
+  const { sent } = engine(on, ['{"tier":"trivial","why":"thanks"}', '{"tier":"simple","why":"explain"}'], 150_000)
+  await say($, 'thanks!')
+  await step($, 't1', 0)
+  await say($, 'what does the cache do?')
+  await step($, 't2', 0)
+  expect(sent.map(s => s.model)).toEqual(['opus', 'opus'])
+  expect(sent.map(s => s.effort)).toEqual(['low', 'medium'])
+})
+
+test('in a long conversation a #tag sets the effort and the model stays opus', async ($, on) => {
   const { sent } = engine(on, '{"tier":"hard","why":"bug"}', 150_000)
   await say($, 'the app crashes')
   await step($, 't1', 0)
   await say($, 'thanks #trivial')
   await step($, 't2', 0)
-  expect(sent[1]?.model).toBe('haiku')
+  expect(sent[1]?.model).toBe('opus')
+  expect(sent[1]?.effort).toBe('low')
+})
+
+test('a short conversation still uses the cheaper models', async ($, on) => {
+  const { sent } = engine(on, '{"tier":"simple","why":"explain"}', 20_000)
+  await say($, 'what is a venv?')
+  await step($, 't1', 0)
+  expect(sent[0]?.model).toBe('sonnet')
 })
 
 const STUCK = '{"tier":"max","why":"stuck after 4 fixes"}'
@@ -401,7 +433,7 @@ test("the person's own #max in a wake does force max", async ($, on) => {
   expect(sent[0]?.effort).toBe('max')
 })
 
-test('a system event keeps the last pick and adds no note', async ($, on) => {
+test('a system event carries the last pick and adds no note', async ($, on) => {
   const { sent, asked, notes } = engine(on, '{"tier":"hard","why":"bug"}')
   await say($, 'the app crashes')
   await say($, '<wake reason="device"><system-note>Device connected.</system-note></wake>')
@@ -409,6 +441,29 @@ test('a system event keeps the last pick and adds no note', async ($, on) => {
   expect(asked.length).toBe(1)
   expect(notes.length).toBe(1)
   expect(sent[0]?.effort).toBe('xhigh')
+})
+
+test('max never carries into a turn you did not start', async ($, on) => {
+  const { sent } = engine(on)
+  await say($, 'go deep on it #max')
+  await step($, 't1', 0)
+  await say($, '<wake reason="github"><system-note>CI failed on the PR.</system-note></wake>')
+  await step($, 't2', 0)
+  await notify($, 'Background command finished with exit code 0')
+  await step($, 't3', 0)
+  expect(sent.map(s => s.effort)).toEqual(['max', 'xhigh', 'xhigh'])
+})
+
+test('a carried pick moves to opus once the conversation is long', async ($, on) => {
+  let tokens = 20_000
+  const { sent } = engine(on, '{"tier":"trivial","why":"thanks"}', () => tokens)
+  await say($, 'thanks!')
+  await step($, 't1', 0)
+  tokens = 150_000
+  await notify($, 'Background command finished with exit code 0')
+  await step($, 't2', 0)
+  expect(sent.map(s => s.model)).toEqual(['haiku', 'opus'])
+  expect(sent[1]?.effort).toBe('low')
 })
 
 test('a message that arrives mid-turn is told it applies from the next turn', async ($, on) => {

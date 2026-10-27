@@ -61,8 +61,9 @@ export const CLASSIFIER: ModelRouterClassifier = {
 }
 
 // The highest tier the router picks on its own. When the classifier says a
-// higher tier (max), the router runs this one instead and Claude tells you in
-// its reply that it recommends max: type #max to run it. Max only on request.
+// higher tier (max), no work starts: Claude only asks "Reply yes to run it at
+// max, or no to run it at hard", and your answer picks the route. Max only
+// with your yes (or a #max you type).
 export const AUTO_TIER_CAP: ModelRouterTier = 'hard'
 
 // In a long conversation, switching to a cheaper model costs MORE than it

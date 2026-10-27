@@ -2,11 +2,14 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { ModelCompleteRequest, On, TurnStepInput } from 'claude-code'
 
+import type { SessionRow } from '../hooks/route'
+
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
 // Nothing sits beneath the plugin in a test: these hooks stand for the
 // engine. `reply` is what the classifier model answers; `asked` records
 // what it was asked, `sent` the model requests the router let through.
+// A test adds to `rows` what the transcript holds after the fixed opening.
 function engine(
   on: On,
   reply: string | readonly string[] | 'api-error' = '{"tier":"standard","why":"x"}',
@@ -14,6 +17,7 @@ function engine(
 ) {
   const sent: TurnStepInput[] = []
   const asked: ModelCompleteRequest[] = []
+  const rows: SessionRow[] = []
   on('command.register', () => ({ value: { command: 'route' } }))
   const notes: string[] = []
   on('prompt.submit', (_, e) => {
@@ -27,6 +31,7 @@ function engine(
       { role: 'assistant', text: 'Plan: 4 files, new threading model.', toolUses: [] },
       // A busy session ends in rows with no text: tool calls and their results.
       ...Array.from({ length: 8 }, () => ({ role: 'assistant' as const, text: '', toolUses: [] })),
+      ...rows.map(r => ({ ...r, toolUses: (r.toolUses ?? []).map((u, i) => ({ ...u, tool_use_id: `tu${i}` })) })),
     ],
   }))
   // A list of replies is answered in order, one per classifier call.
@@ -52,7 +57,7 @@ function engine(
       usage: { ...USAGE, cache_read_input_tokens: contextTokens, model: e.model },
     }
   })
-  return { sent, asked, notes }
+  return { sent, asked, notes, rows }
 }
 
 async function step($: Engine, turnId: string, index: number, agentId?: string) {
@@ -253,13 +258,109 @@ test('in a long conversation a #tag still forces a lower tier', async ($, on) =>
   expect(sent[1]?.model).toBe('haiku')
 })
 
-test('max is only recommended: the turn runs hard and Claude is told to say so', async ($, on) => {
-  const { sent, notes } = engine(on, '{"tier":"max","why":"stuck after 4 fixes"}')
+const STUCK = '{"tier":"max","why":"stuck after 4 fixes"}'
+const ASK = 'The router recommends max for this. Reply yes to run it at max, or no to run it at hard.'
+
+// The transcript after a max pick: the request, then Claude's question.
+function asked_max(rows: SessionRow[]) {
+  rows.push({ role: 'user', text: 'we tried 4 fixes and it still fails' }, { role: 'assistant', text: ASK })
+}
+
+test('a max pick starts no work: the turn only asks, on the cheapest tier', async ($, on) => {
+  const { sent, notes } = engine(on, STUCK)
   await say($, 'we tried 4 fixes and it still fails')
+  await step($, 't1', 0)
+  expect(sent[0]?.model).toBe('haiku')
+  expect(sent[0]?.effort).toBe('low')
+  expect(notes[0]).toContain('Do not start the work')
+  expect(notes[0]).toContain(`"${ASK}"`)
+  expect(notes[0]).toContain('Then end your turn.')
+})
+
+test('yes to the question runs max, without asking the classifier', async ($, on) => {
+  const { sent, asked, notes, rows } = engine(on, STUCK)
+  await say($, 'we tried 4 fixes and it still fails')
+  await step($, 't1', 0)
+  asked_max(rows)
+  await say($, 'Yes')
+  await step($, 't2', 0)
+  expect(asked.length).toBe(1)
+  expect(sent[1]?.effort).toBe('max')
+  expect(notes[1]).toContain('picked by answer: user said yes to max')
+  expect(notes[1]).toContain('do that request now')
+})
+
+test('no to the question runs hard', async ($, on) => {
+  const { sent, rows } = engine(on, STUCK)
+  asked_max(rows)
+  await say($, 'no, hard is enough')
   await step($, 't1', 0)
   expect(sent[0]?.model).toBe('opus')
   expect(sent[0]?.effort).toBe('xhigh')
-  expect(notes[0]).toContain('reply #max to use it')
+})
+
+test('the question is read from the transcript, so a yes after a restart still runs max', async ($, on) => {
+  // A fresh process: nothing in memory, only the transcript.
+  const { sent, asked, rows } = engine(on)
+  asked_max(rows)
+  await say($, 'yes')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(0)
+  expect(sent[0]?.effort).toBe('max')
+})
+
+test('any other reply is classified as a new request, and a later yes is ordinary', async ($, on) => {
+  const { sent, asked, rows } = engine(on, ['{"tier":"simple","why":"q"}', '{"tier":"trivial","why":"ack"}'])
+  asked_max(rows)
+  await say($, 'first, what does the log say?')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(1)
+  expect(sent[0]?.model).toBe('sonnet')
+  rows.push({ role: 'user', text: 'first, what does the log say?' }, { role: 'assistant', text: 'It says timeout.' })
+  await say($, 'yes')
+  await step($, 't2', 0)
+  expect(asked.length).toBe(2)
+  expect(sent[1]?.effort).toBe('low')
+})
+
+test('in a long conversation the asking turn keeps opus, at low effort', async ($, on) => {
+  const { sent } = engine(on, ['{"tier":"standard","why":"feature"}', STUCK], 150_000)
+  await say($, 'add the export')
+  await step($, 't1', 0)
+  await say($, 'it still fails after 4 fixes')
+  await step($, 't2', 0)
+  expect(sent[1]?.model).toBe('opus')
+  expect(sent[1]?.effort).toBe('low')
+})
+
+test('a yes in a relayed note does not answer the question', async ($, on) => {
+  const { sent, asked, rows } = engine(on, '{"tier":"standard","why":"review"}')
+  asked_max(rows)
+  await say($, '<relay from="thread"><note>yes</note></relay>')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(1)
+  expect(sent[0]?.effort).toBe('high')
+})
+
+test("in a thread, the person's yes answers the question Claude posted with its reply tool", async ($, on) => {
+  const { sent, asked, rows } = engine(on)
+  rows.push(
+    { role: 'user', text: '<wake reason="mention"><message from="human">we tried 4 fixes</message></wake>' },
+    { role: 'assistant', text: '', toolUses: [{ tool: 'mcp__hearthbot__post_message', input: { text: ASK } }] },
+    // A system event in between is not the person writing.
+    { role: 'user', text: '<wake reason="device"><system-note>Device connected.</system-note></wake>' },
+  )
+  await say($, '<wake reason="mention"><message from="human" author="Mihai">yes</message></wake>')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(0)
+  expect(sent[0]?.effort).toBe('max')
+})
+
+test('a max pick that arrives mid-turn asks without stopping the running work', async ($, on) => {
+  const { notes } = engine(on, STUCK)
+  await $.prompt.submit({ text: 'it still fails', wait: false, origin: { kind: 'composer' }, turnId: 't1' })
+  expect(notes[0]).toContain('Reply yes to run it at max')
+  expect(notes[0]).toContain('Carry on with the work already running.')
 })
 
 test('#max runs max', async ($, on) => {

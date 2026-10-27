@@ -176,6 +176,69 @@ export function capAutoTier(d: ModelRouterDecision, cap: ModelRouterTier, tiers:
   return { ...decide(cap, d.source, d.why, tiers), recommended: d.tier }
 }
 
+/**
+ * A recommendation holds the work until the person answers yes or no. The
+ * turn that asks does no work, so it runs on the cheapest tier.
+ */
+export function holdForAnswer(d: ModelRouterDecision, tiers: Tiers): ModelRouterDecision {
+  if (d.recommended === null) {
+    return d
+  }
+  return { ...decide(TIER_ORDER[0] as ModelRouterTier, d.source, d.why, tiers), recommended: d.recommended }
+}
+
+const YES = ['yes', 'y', 'yeah', 'yep', 'yup', 'ok', 'okay', 'sure', 'go', 'do', 'proceed']
+const NO = ['no', 'n', 'nope', 'nah']
+
+/** The person's yes or no, read from the first word of their message; null for anything else. */
+export function readAnswer(words: string): 'yes' | 'no' | null {
+  const first = words.trim().toLowerCase().match(/^[a-z]+/)
+  if (first === null) {
+    return null
+  }
+  if (YES.includes(first[0])) {
+    return 'yes'
+  }
+  return NO.includes(first[0]) ? 'no' : null
+}
+
+/** The one line Claude replies with while the work is held. */
+export function heldQuestion(recommended: ModelRouterTier, cap: ModelRouterTier): string {
+  return `The router recommends ${recommended} for this. Reply yes to run it at ${recommended}, or no to run it at ${cap}.`
+}
+
+const HELD_QUESTION = /The router recommends ([a-z]+) for this\. Reply yes to run it at \1, or no to run it at ([a-z]+)\./
+
+/**
+ * The question Claude asked in its replies since the person last wrote, read
+ * back from the transcript so it holds across a restart or a resumed session;
+ * null when Claude did not ask.
+ */
+export function findHeldQuestion(
+  rows: readonly SessionRow[],
+): { recommended: ModelRouterTier; cap: ModelRouterTier } | null {
+  const messages = visibleMessages(rows)
+  const replies = messages.slice(messages.map(m => m.role).lastIndexOf('user') + 1)
+  for (const reply of replies.reverse()) {
+    const m = reply.text.match(HELD_QUESTION)
+    const [recommended, cap] = [m?.[1], m?.[2]] as ModelRouterTier[]
+    if (recommended !== undefined && cap !== undefined && TIER_ORDER.includes(recommended) && TIER_ORDER.includes(cap)) {
+      return { recommended, cap }
+    }
+  }
+  return null
+}
+
+/** The route for the held work: yes runs the recommended tier, no runs the cap. */
+export function answerHeld(
+  recommended: ModelRouterTier,
+  answer: 'yes' | 'no',
+  cap: ModelRouterTier,
+  tiers: Tiers,
+): ModelRouterDecision {
+  return decide(answer === 'yes' ? recommended : cap, 'answer', `user said ${answer} to ${recommended}`, tiers)
+}
+
 function cut(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)} [...cut]`
 }
@@ -200,23 +263,25 @@ export function rowText(row: SessionRow): string {
 }
 
 /**
+ * The rows as the person and Claude see them: every row unwrapped (rowText,
+ * then extractRequest), and rows left with no text (tool calls, tool
+ * results, system events) dropped.
+ */
+function visibleMessages(rows: readonly SessionRow[]): ContextMessage[] {
+  return rows.map(r => ({ role: r.role, text: extractRequest(rowText(r)) })).filter(r => r.text.trim() !== '')
+}
+
+/**
  * What the classifier reads, from the raw prompt and the raw session rows:
- * the prompt and every row are unwrapped (rowText, then extractRequest), then
- * rows left with no text (tool calls, tool results, system events) are
- * dropped BEFORE the last `n` are taken.
+ * the prompt unwrapped, and the last `n` visible messages (empty rows are
+ * dropped BEFORE the last `n` are taken).
  */
 export function prepareClassifierInput(
   prompt: string,
   rows: readonly SessionRow[],
   n: number,
 ): { prompt: string; context: ContextMessage[] } {
-  const context =
-    n === 0
-      ? []
-      : rows
-          .map(r => ({ role: r.role, text: extractRequest(rowText(r)) }))
-          .filter(r => r.text.trim() !== '')
-          .slice(-n)
+  const context = n === 0 ? [] : visibleMessages(rows).slice(-n)
   return { prompt: extractRequest(prompt), context }
 }
 
@@ -289,7 +354,7 @@ export function decide(
 }
 
 export function label(d: ModelRouterDecision): string {
-  const rec = d.recommended === null ? '' : `, ${d.recommended} recommended`
+  const rec = d.recommended === null ? '' : `, asking about ${d.recommended}`
   const head = `route: ${d.model} · ${d.effort} (${d.tier}${rec})`
   return d.source === 'error' ? `${head} CLASSIFIER FAILED: ${d.why}` : head
 }
@@ -297,16 +362,27 @@ export function label(d: ModelRouterDecision): string {
 /**
  * The hidden note the answering model reads beside the prompt. A message
  * that arrives while a turn runs is routed for the next turn: the running
- * turn keeps the route it started with.
+ * turn keeps the route it started with. A recommendation tells Claude to ask
+ * and do no work; the answer tells it to do the held work now.
  */
-export function routeNote(d: ModelRouterDecision, isMidTurn: boolean): string {
+export function routeNote(d: ModelRouterDecision, isMidTurn: boolean, cap: ModelRouterTier): string {
   const why = d.why === '' ? '' : `: ${d.why}`
   const pick = `${d.model} at ${d.effort} effort (tier ${d.tier}, picked by ${d.source}${why})`
   const base = isMidTurn
     ? `[model-router] The router picked ${pick} for this message. The turn already running keeps its route; the pick applies from the next turn.`
     : `[model-router] This turn runs on ${pick}.`
   if (d.recommended !== null) {
-    return `${base} The router recommends tier ${d.recommended} for this request, but runs it only when the user asks. Start your reply with this one line: "The router recommends ${d.recommended} for this; reply #${d.recommended} to use it."`
+    const then = isMidTurn ? 'Carry on with the work already running.' : 'Then end your turn.'
+    return [
+      base,
+      `The router rates this request ${d.recommended}, which runs only when the user says yes.`,
+      'Do not start the work: no reading files, no commands, no checklist, no partial answer.',
+      `Reply with only this line, as a plain message (not a decision card): "${heldQuestion(d.recommended, cap)}"`,
+      then,
+    ].join(' ')
+  }
+  if (d.source === 'answer') {
+    return `${base} The user has answered the router's question about the request you held back: do that request now, taking their reply into account.`
   }
   return `${base} Mention it only if the user asks which model, effort or route is in use.`
 }
@@ -332,7 +408,7 @@ export function describeRouter(
     '',
     `Classifier: ${classifier.model} · ${classifier.effort}, reads the last ${classifier.contextMessages} messages.`,
     `If it fails: ${onError}.`,
-    `It picks up to ${autoTierCap} on its own; higher tiers only on request, with a recommendation.`,
+    `It picks up to ${autoTierCap} on its own. For a higher tier it asks first: yes runs it, no runs ${autoTierCap}.`,
     `Above ${Math.round(longContextTokens / 1000)}K tokens of context it never switches to a cheaper model; effort still follows the tier.`,
     '',
     'Edit hooks/rules.ts to change them. /route off or /route on to switch.',

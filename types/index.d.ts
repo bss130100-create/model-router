@@ -20,14 +20,18 @@ export type ModelRouterClassifier = {
 
 /**
  * What the router picked for a prompt and why. `source` says who picked:
- * a #tag you typed, the classifier, the declared error tier, or the
- * long-context rule that kept a higher tier.
+ * a #tag you typed, the classifier, the declared error tier, the
+ * long-context rule that kept a higher tier, or your yes or no to a
+ * recommendation.
  */
 export type ModelRouterDecision = ModelRouterRoute & {
   tier: ModelRouterTier
-  source: 'tag' | 'classifier' | 'error' | 'long-context'
+  source: 'tag' | 'classifier' | 'error' | 'long-context' | 'answer'
   why: string
-  /** A higher tier the router recommends but runs only when you ask (#tag). */
+  /**
+   * A higher tier the router recommends. While set, the work waits: the turn
+   * only asks you, and your yes or no on the next message decides the route.
+   */
   recommended: ModelRouterTier | null
 }
 

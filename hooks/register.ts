@@ -4,35 +4,43 @@ import type { EngineInterface, Register, TurnStepInput } from 'claude-code'
 import type { ModelRouterDecision, ModelRouterTurnLock } from '../types'
 import { AUTO_TIER_CAP, CLASSIFIER, LONG_CONTEXT_TOKENS, ON_CLASSIFIER_ERROR, TIERS } from './rules'
 import {
+  answerHeld,
   buildClassifierRequest,
   capAutoTier,
   decide,
   describeRouter,
   extractRequest,
+  findHeldQuestion,
   findTag,
+  holdForAnswer,
   keepStrongerModelInLongContext,
   label,
   parseClassifierReply,
   prepareClassifierInput,
+  readAnswer,
   routeNote,
   unwrap,
   validateConfig,
 } from './route'
+import type { SessionRow } from './route'
 
 // Change a shape tag when that value's fields change: it declines what an
 // earlier version stored, which outlives a reload.
 const last = atom({ plugin: 'model-router', key: 'last' } as const, null as ModelRouterDecision | null, {
-  shape: 'decision-3',
+  shape: 'decision-4',
 })
 const lock = atom({ plugin: 'model-router', key: 'lock' } as const, null as ModelRouterTurnLock | null, {
-  shape: 'lock-3',
+  shape: 'lock-4',
 })
 const isOff = atom({ plugin: 'model-router', key: 'isOff' } as const, false)
 const contextTokens = atom({ plugin: 'model-router', key: 'contextTokens' } as const, 0)
 
 /** Asks the classifier model which tier the prompt needs. */
-async function classify($: EngineInterface, text: string): Promise<ModelRouterDecision> {
-  const rows = CLASSIFIER.contextMessages === 0 ? [] : await $.session.messages()
+async function classify(
+  $: EngineInterface,
+  text: string,
+  rows: readonly SessionRow[],
+): Promise<ModelRouterDecision> {
   const input = prepareClassifierInput(text, rows, CLASSIFIER.contextMessages)
   const ask = buildClassifierRequest(input.prompt, input.context, TIERS)
   const reply = await $.model.complete({
@@ -55,20 +63,41 @@ async function classify($: EngineInterface, text: string): Promise<ModelRouterDe
 }
 
 /**
- * The classifier's tier with the two cost rules applied: max only on request
- * (AUTO_TIER_CAP), and in a long conversation never a cheaper model than the
- * route that ran last.
+ * The classifier's tier with the cost rules applied: above AUTO_TIER_CAP the
+ * work waits for the person's yes or no, and in a long conversation never a
+ * cheaper model than the route that ran last.
  */
-async function pick($: EngineInterface, text: string): Promise<ModelRouterDecision> {
-  const capped = capAutoTier(await classify($, text), AUTO_TIER_CAP, TIERS)
+async function pick($: EngineInterface, text: string, rows: readonly SessionRow[]): Promise<ModelRouterDecision> {
+  const held = holdForAnswer(capAutoTier(await classify($, text, rows), AUTO_TIER_CAP, TIERS), TIERS)
   const ran = await read($, lock)
   return keepStrongerModelInLongContext(
-    capped,
+    held,
     ran === null ? null : ran.decision,
     await read($, contextTokens),
     LONG_CONTEXT_TOKENS,
     TIERS,
   )
+}
+
+/**
+ * The route for a prompt. Only the person's own words can force a tier or
+ * answer the router's question: a #max or "yes" that Claude wrote, relayed or
+ * quoted in a note, must not. A #tag wins, then a yes or no to the question
+ * Claude last asked (read from the transcript), then the classifier.
+ */
+async function choose($: EngineInterface, text: string): Promise<ModelRouterDecision> {
+  const words = unwrap(text).words
+  const tag = findTag(words)
+  if (tag !== null) {
+    return decide(tag, 'tag', `#${tag} tag`, TIERS)
+  }
+  const rows = await $.session.messages()
+  const answer = readAnswer(words)
+  const held = answer === null ? null : findHeldQuestion(rows)
+  if (answer !== null && held !== null) {
+    return answerHeld(held.recommended, answer, held.cap, TIERS)
+  }
+  return pick($, text, rows)
 }
 
 /** The declared error tier, said out loud: never a silent fallback. */
@@ -118,15 +147,12 @@ export const register: Register = on => {
     if (isSkipped) {
       return next(e)
     }
-    // Only the person's own words can force a tier: a #max that Claude wrote,
-    // relayed or quoted in a note, must not.
-    const tag = findTag(unwrap(e.text).words)
-    const decision = tag === null ? await pick($, e.text) : decide(tag, 'tag', `#${tag} tag`, TIERS)
+    const decision = await choose($, e.text)
     await update($, last, () => decision)
     $.ui.status(label(decision))
     // Tell the answering model its route, so in any session (Projects threads
     // included, where /route cannot run) you can ask "which route are you on?".
-    const note = routeNote(decision, e.turnId !== undefined)
+    const note = routeNote(decision, e.turnId !== undefined, AUTO_TIER_CAP)
     return next({ ...e, context: [...(e.context ?? []), note] })
   }).catch(async ($, e, next) => {
     // Never reuse a stale pick: clear it, say so, and let the prompt through.

@@ -22,9 +22,9 @@ Each prompt runs two ways:
 
 The run copies `hooks/route.ts`, `hooks/rules.ts` and `types/` into a throwaway harness mod and calls
 `prepareClassifierInput`, `buildClassifierRequest` and `$.model.complete` exactly as the router does.
-A run is scored on the tier that actually runs: when the classifier says a tier above
-`AUTO_TIER_CAP`, the router runs the cap and shows a recommendation, so the eval scores the cap and
-counts the recommendation separately. It exits 1 when either mode falls below its floor (95% context,
+A run is scored on the tier that does the work by default: when the classifier says a tier above
+`AUTO_TIER_CAP`, the router asks first and runs the cap unless the person says yes, so the eval
+scores the cap and counts the question separately. It exits 1 when either mode falls below its floor (95% context,
 90% thread). Every miss is printed with the classifier's reason.
 
 A label may change only for a reason that doesn't depend on what the classifier picked, and the case

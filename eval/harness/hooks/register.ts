@@ -26,7 +26,7 @@ async function classify($: EngineInterface, job: Job) {
   }
   try {
     const { tier, why } = parseClassifierReply(reply.text)
-    // The tier that runs: above AUTO_TIER_CAP the router runs the cap and recommends the higher tier.
+    // The tier that does the work by default: above AUTO_TIER_CAP the router asks, and a no runs the cap.
     const ran = capAutoTier(decide(tier, 'classifier', why, TIERS), AUTO_TIER_CAP, TIERS)
     return { ...base, ok: true, classified: tier, tier: ran.tier, recommended: ran.recommended, why }
   } catch (err) {

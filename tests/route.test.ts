@@ -2,15 +2,20 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { AUTO_TIER_CAP, CLASSIFIER, LONG_CONTEXT_TOKENS, ON_CLASSIFIER_ERROR, TIERS } from '../hooks/rules'
 import {
+  answerHeld,
   buildClassifierRequest,
   capAutoTier,
   decide,
   describeRouter,
   extractRequest,
+  findHeldQuestion,
   findTag,
+  heldQuestion,
+  holdForAnswer,
   keepStrongerModelInLongContext,
   parseClassifierReply,
   prepareClassifierInput,
+  readAnswer,
   routeNote,
   rowText,
   unwrap,
@@ -110,6 +115,7 @@ test('describeRouter lists every tier and the classifier', async () => {
   expect(text).toContain('max -> opus · max')
   expect(text).toContain('Classifier: haiku · low')
   expect(text).toContain('Above 50K tokens of context it never switches to a cheaper model')
+  expect(text).toContain('For a higher tier it asks first: yes runs it, no runs hard.')
 })
 
 // A Projects relay as it arrives, preamble included: the preamble names the
@@ -297,20 +303,127 @@ describe('capAutoTier', () => {
   })
 })
 
+describe('holdForAnswer', () => {
+  test('a pick with no recommendation stands', async () => {
+    const hard = decide('hard', 'classifier', 'bug', TIERS)
+    expect(holdForAnswer(hard, TIERS)).toBe(hard)
+  })
+
+  test('a recommendation runs the cheapest tier, since the turn only asks', async () => {
+    const held = holdForAnswer(capAutoTier(decide('max', 'classifier', 'stuck', TIERS), 'hard', TIERS), TIERS)
+    expect(held).toEqual({
+      tier: 'trivial',
+      source: 'classifier',
+      why: 'stuck',
+      model: 'haiku',
+      effort: 'low',
+      recommended: 'max',
+    })
+  })
+})
+
+describe('readAnswer', () => {
+  test('reads yes from the first word', async () => {
+    expect(readAnswer('Yes!')).toBe('yes')
+    expect(readAnswer('  ok go ahead')).toBe('yes')
+    expect(readAnswer('y')).toBe('yes')
+    expect(readAnswer('do it')).toBe('yes')
+  })
+  test('reads no from the first word', async () => {
+    expect(readAnswer('no, hard is fine')).toBe('no')
+    expect(readAnswer('Nope')).toBe('no')
+  })
+  test('anything else is not an answer', async () => {
+    expect(readAnswer('nothing works still')).toBe(null)
+    expect(readAnswer('what does max cost?')).toBe(null)
+    expect(readAnswer('')).toBe(null)
+  })
+})
+
+describe('findHeldQuestion', () => {
+  const ask = heldQuestion('max', 'hard')
+
+  test('finds the question in Claude\'s reply, with both tiers', async () => {
+    const rows = [
+      { role: 'user' as const, text: 'stuck on the freeze' },
+      { role: 'assistant' as const, text: ask },
+    ]
+    expect(findHeldQuestion(rows)).toEqual({ recommended: 'max', cap: 'hard' })
+  })
+
+  test('finds it in a reply tool call, past tool rows and system events', async () => {
+    const rows = [
+      { role: 'user' as const, text: 'stuck on the freeze' },
+      { role: 'assistant' as const, text: '', toolUses: [{ tool: 'mcp__x__post_message', input: { text: ask } }] },
+      { role: 'assistant' as const, text: '' },
+      { role: 'user' as const, text: '<wake reason="device"><system-note>Connected.</system-note></wake>' },
+    ]
+    expect(findHeldQuestion(rows)).toEqual({ recommended: 'max', cap: 'hard' })
+  })
+
+  test('null once the person has written after it', async () => {
+    const rows = [
+      { role: 'assistant' as const, text: ask },
+      { role: 'user' as const, text: 'what does the log say?' },
+      { role: 'assistant' as const, text: 'It says timeout.' },
+    ]
+    expect(findHeldQuestion(rows)).toBe(null)
+  })
+
+  test('null when the line names no real tier', async () => {
+    const rows = [{ role: 'assistant' as const, text: heldQuestion('huge' as never, 'hard') }]
+    expect(findHeldQuestion(rows)).toBe(null)
+  })
+})
+
+describe('answerHeld', () => {
+  test('yes runs the recommended tier', async () => {
+    expect(answerHeld('max', 'yes', 'hard', TIERS)).toEqual({
+      tier: 'max',
+      source: 'answer',
+      why: 'user said yes to max',
+      model: 'opus',
+      effort: 'max',
+      recommended: null,
+    })
+  })
+  test('no runs the cap', async () => {
+    expect(answerHeld('max', 'no', 'hard', TIERS).effort).toBe('xhigh')
+  })
+})
+
 describe('routeNote', () => {
-  test('a recommendation tells Claude to say it in the reply', async () => {
-    const d = capAutoTier(decide('max', 'classifier', 'stuck', TIERS), 'hard', TIERS)
-    expect(routeNote(d, false)).toContain(
-      'Start your reply with this one line: "The router recommends max for this; reply #max to use it."',
+  const held = holdForAnswer(capAutoTier(decide('max', 'classifier', 'stuck', TIERS), 'hard', TIERS), TIERS)
+
+  test('a recommendation tells Claude to ask, start no work and end the turn', async () => {
+    const note = routeNote(held, false, 'hard')
+    expect(note).toContain('Do not start the work')
+    expect(note).toContain(
+      'Reply with only this line, as a plain message (not a decision card): "The router recommends max for this. Reply yes to run it at max, or no to run it at hard."',
+    )
+    expect(note).toContain('Then end your turn.')
+  })
+
+  test('mid-turn, a recommendation asks but lets the running work carry on', async () => {
+    const note = routeNote(held, true, 'hard')
+    expect(note).toContain('Carry on with the work already running.')
+    expect(note).not.toContain('Then end your turn.')
+  })
+
+  test('an answer tells Claude to do the held request now', async () => {
+    expect(routeNote(answerHeld('max', 'yes', 'hard', TIERS), false, 'hard')).toContain(
+      'do that request now, taking their reply into account',
     )
   })
 
   test('no recommendation: mention the route only when asked', async () => {
-    expect(routeNote(decide('simple', 'classifier', 'q', TIERS), false)).toContain('Mention it only if the user asks')
+    expect(routeNote(decide('simple', 'classifier', 'q', TIERS), false, 'hard')).toContain(
+      'Mention it only if the user asks',
+    )
   })
 
   test('a message that arrives mid-turn is routed for the next turn', async () => {
-    const note = routeNote(decide('simple', 'classifier', 'q', TIERS), true)
+    const note = routeNote(decide('simple', 'classifier', 'q', TIERS), true, 'hard')
     expect(note).toContain('The router picked sonnet at medium effort (tier simple, picked by classifier: q) for this message.')
     expect(note).toContain('The turn already running keeps its route; the pick applies from the next turn.')
     expect(note).not.toContain('This turn runs on')

@@ -26,12 +26,12 @@ line fails setup loudly if the wrong version got installed.
 
 ```
 set -e
-claude plugin marketplace add bss130100-create/model-router#release-0.3.0
+claude plugin marketplace add bss130100-create/model-router#release-0.4.0
 claude plugin install model-router@mihai-mods
-claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.3.0" || { echo "model-router: installed version is not 0.3.0" >&2; exit 1; }
+claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.4.0" || { echo "model-router: installed version is not 0.4.0" >&2; exit 1; }
 ```
 
-To update: push a `release-<version>` branch, then change both `0.3.0`s in the script.
+To update: push a `release-<version>` branch, then change both `0.4.0`s in the script.
 
 ## What it does
 
@@ -56,14 +56,21 @@ one: accuracy first, then cost. Subagents are left alone.
 | hard | opus · xhigh | hard bugs, tricky design, multi-file refactor |
 | max | opus · max | stuck after several tries, deep root-cause hunt |
 
-**Max only on request.** The router picks up to `hard` on its own
-(`AUTO_TIER_CAP`). When the classifier says `max`, the turn runs at `hard` and
-Claude starts its reply with: "The router recommends max for this; reply #max
-to use it."
+**Max only with your yes.** The router picks up to `hard` on its own
+(`AUTO_TIER_CAP`). When the classifier says `max`, no work starts: Claude only
+replies "The router recommends max for this. Reply yes to run it at max, or no
+to run it at hard." That asking turn runs on the cheapest tier (in a long
+conversation, on the same model at low effort). Your next message decides:
+
+- `yes` (or y, yeah, yep, ok, okay, sure, go) runs the held request at max.
+- `no` (or n, nope, nah) runs it at hard.
+- Anything else is a new request: it is classified as usual and the held one is dropped.
+
+Only the first word counts, so "no, and also check the logs" is a no.
 
 Type `#trivial`, `#simple`, `#standard`, `#hard` or `#max` anywhere in a prompt
 to force a tier. A tag skips the classifier. Only tags in your own words count: a
-`#max` that Claude wrote, or that a colleague's note quotes, does not.
+`#max` (or a yes) that Claude wrote, or that a colleague's note quotes, does not.
 
 **Long conversations.** Each model keeps its own prompt cache, so moving to a
 cheaper model in a long conversation re-reads everything at full price and costs

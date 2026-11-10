@@ -24,6 +24,7 @@ export function validateConfig(
   classifier: ModelRouterClassifier,
   onError: ModelRouterTier,
   autoTierCap: ModelRouterTier,
+  carryFloor: ModelRouterTier,
 ): void {
   if (model.trim() === '') {
     throw new Error('model-router: MODEL is empty')
@@ -54,6 +55,9 @@ export function validateConfig(
   if (!TIER_ORDER.includes(autoTierCap)) {
     throw new Error(`model-router: AUTO_TIER_CAP "${autoTierCap}" is not a tier`)
   }
+  if (!TIER_ORDER.includes(carryFloor) || TIER_ORDER.indexOf(carryFloor) > TIER_ORDER.indexOf(autoTierCap)) {
+    throw new Error(`model-router: CARRY_FLOOR "${carryFloor}" must be a tier no higher than AUTO_TIER_CAP`)
+  }
 }
 
 function checkEffort(where: string, effort: ModelRouterEffort): void {
@@ -62,9 +66,13 @@ function checkEffort(where: string, effort: ModelRouterEffort): void {
   }
 }
 
-/** A #tier tag typed in the prompt; with several, the highest wins. */
+/**
+ * A #tier tag typed in the prompt; with several, the highest wins. Only a
+ * tag of its own counts: not one inside a word, URL or file name
+ * (`page.html#simple`) or a longer name (`#max-width`).
+ */
 export function findTag(text: string): ModelRouterTier | null {
-  const found = [...text.toLowerCase().matchAll(/#([a-z]+)\b/g)]
+  const found = [...text.toLowerCase().matchAll(/(?<![\w.\/#-])#([a-z]+)(?![\w-])/g)]
     .map(m => m[1] as ModelRouterTier)
     .filter(t => TIER_ORDER.includes(t))
   if (found.length === 0) {
@@ -107,6 +115,11 @@ export type Unwrapped = { words: string; notes: string[] }
 // reminder): never the person's words.
 const HARNESS_BLOCK = /<(task-notification|system-reminder)\b[\s\S]*?<\/\1>/g
 
+/** Whether a prompt is a Projects delivery (a wake or a relay), outside what the harness adds. */
+export function isWrapped(text: string): boolean {
+  return /<(wake|relay|coordinator-relay)\b/.test(text.replace(HARNESS_BLOCK, ''))
+}
+
 /**
  * In a Projects thread a prompt arrives wrapped in XML: a <wake> holding
  * <message>s, or a <relay> holding <cited> messages and a <note>. Only a
@@ -117,7 +130,7 @@ const HARNESS_BLOCK = /<(task-notification|system-reminder)\b[\s\S]*?<\/\1>/g
  */
 export function unwrap(text: string): Unwrapped {
   const own = text.replace(HARNESS_BLOCK, '')
-  if (!/<(wake|relay|coordinator-relay)\b/.test(own)) {
+  if (!isWrapped(own)) {
     return { words: own, notes: [] }
   }
   const words = [...inner(own, 'message', /\bfrom="human"/), ...inner(own, 'cited', /\bauthor="user"/)]
@@ -148,15 +161,30 @@ export function capAutoTier(d: ModelRouterDecision, cap: ModelRouterTier, tiers:
 
 /**
  * The pick a turn the person did not start (a background task's
- * notification, a system event, a slash command) carries from their last
- * prompt: the same tier, but never above the cap, so max runs only for the
- * request it was asked for.
+ * notification, a PR event, a system event, a slash command) carries from
+ * their last prompt, kept between `floor` and `cap`: such a turn usually
+ * does real work (reads a result, fixes a failing check), even after a
+ * "thanks" picked trivial, and max runs only for the request it was asked
+ * for. A pick no turn has run yet (a #max or yes typed while a turn was
+ * running) carries whole, so it runs on the next turn. With no pick (a new
+ * session, or after a restart) the turn runs at the floor.
  */
-export function carryPick(d: ModelRouterDecision, cap: ModelRouterTier, tiers: Tiers): ModelRouterDecision {
-  if (TIER_ORDER.indexOf(d.tier) <= TIER_ORDER.indexOf(cap)) {
+export function carryPick(
+  d: ModelRouterDecision | null,
+  floor: ModelRouterTier,
+  cap: ModelRouterTier,
+  tiers: Tiers,
+): ModelRouterDecision {
+  if (d === null) {
+    return decide(floor, 'carry', 'no pick yet', tiers)
+  }
+  const at = TIER_ORDER.indexOf(d.tier)
+  const top = d.ran ? TIER_ORDER.indexOf(cap) : TIER_ORDER.length - 1
+  const tier = TIER_ORDER[Math.min(Math.max(at, TIER_ORDER.indexOf(floor)), top)] as ModelRouterTier
+  if (tier === d.tier && d.recommended === null) {
     return d
   }
-  return decide(cap, d.source, d.why, tiers)
+  return { ...decide(tier, d.source, d.why, tiers), ran: d.ran }
 }
 
 /**
@@ -174,18 +202,26 @@ const YES = ['yes', 'y', 'yeah', 'yep', 'yup', 'ok', 'okay', 'sure', 'proceed']
 const NO = ['no', 'n', 'nope', 'nah']
 // A yes only when the whole message is made of them: "go", "do it", "go ahead".
 const GO = ['go', 'ahead', 'do', 'it', 'for']
+// Words that turn an opening yes or no into something else: "ok wait, ...", "sure, but ...".
+const HEDGE = ['but', 'wait', 'though', 'however', 'actually', 'first']
+const ANSWER_WORDS = 10
 
 /**
  * The person's yes or no to the router's question; null for anything else,
- * which is then classified as a new request. A message that opens with a yes
- * word is a yes, and one that opens with a no word is a no, unless it also
- * holds the opposite ("ok wait, no"). "go" and "do" count only in a message
- * made of nothing else, so "do it at hard instead" or "do you think..." is not a yes.
+ * which is then classified as a new request. A short message that opens with
+ * a yes word is a yes, and one that opens with a no word is a no, unless it
+ * also holds the opposite ("ok wait, no"), a hedge ("sure, but..."), or a
+ * question ("ok, what is 2+2?"): those start something new. "go" and "do"
+ * count only in a message made of nothing else, so "do it at hard instead"
+ * or "do you think..." is not a yes.
  */
 export function readAnswer(words: string): 'yes' | 'no' | null {
   const tokens = words.toLowerCase().match(/[a-z]+/g) ?? []
   const first = tokens[0]
   if (first === undefined) {
+    return null
+  }
+  if (tokens.length > ANSWER_WORDS || words.includes('?') || tokens.some(t => HEDGE.includes(t))) {
     return null
   }
   if (YES.includes(first)) {
@@ -207,13 +243,14 @@ const HELD_QUESTION = /The router recommends ([a-z]+) for this\. Reply yes to ru
 /**
  * The question Claude asked in its replies since the person last wrote, read
  * back from the transcript so it holds across a restart or a resumed session;
- * null when Claude did not ask.
+ * null when Claude did not ask. Only the person's own words end the wait: a
+ * colleague's note in between does not.
  */
 export function findHeldQuestion(
   rows: readonly SessionRow[],
 ): { recommended: ModelRouterTier; cap: ModelRouterTier } | null {
-  const messages = visibleMessages(rows)
-  const replies = messages.slice(messages.map(m => m.role).lastIndexOf('user') + 1)
+  const lastWords = rows.findLastIndex(r => r.role === 'user' && unwrap(rowText(r)).words.trim() !== '')
+  const replies = visibleMessages(rows.slice(lastWords + 1)).filter(m => m.role === 'assistant')
   for (const reply of replies.reverse()) {
     const m = reply.text.match(HELD_QUESTION)
     const [recommended, cap] = [m?.[1], m?.[2]] as ModelRouterTier[]
@@ -354,7 +391,32 @@ export function decide(
   why: string,
   tiers: Tiers,
 ): ModelRouterDecision {
-  return { tier, source, why, model: MODEL, effort: tiers[tier].effort, recommended: null }
+  return { tier, source, why, model: MODEL, effort: tiers[tier].effort, recommended: null, ran: false }
+}
+
+/** Where the rows that arrived since Claude's last reply start: the batch the next turn answers. */
+export function batchStart(rows: readonly SessionRow[]): number {
+  return rows.findLastIndex(r => r.role === 'assistant') + 1
+}
+
+/**
+ * The words of a turn's start-up batch that no prompt.submit routed. A
+ * Projects thread starts with several rows queued at once (the coordinator's
+ * relay holding the person's message, then system wakes), and the turn's own
+ * prompt is the last of them, which has no words. `rows` is the transcript
+ * before the current prompt; `routedAt` is the row count when the last pick
+ * was made (-1 for none). '' when there is nothing unrouted.
+ */
+export function unroutedBatch(rows: readonly SessionRow[], routedAt: number): string {
+  const start = batchStart(rows)
+  if (routedAt >= start) {
+    return ''
+  }
+  return rows
+    .slice(start)
+    .map(rowText)
+    .filter(t => isWrapped(t) && extractRequest(t).trim() !== '')
+    .join('\n')
 }
 
 export function label(d: ModelRouterDecision): string {
@@ -394,7 +456,9 @@ export function routeNote(d: ModelRouterDecision, isMidTurn: boolean, cap: Model
   return [
     base,
     'Mention it only if the user asks which model, effort or route is in use.',
-    'The router sets the model and effort of every turn, so changing them in the session has no effect:',
+    `The router sets the model and effort of every turn, so this turn runs on ${d.model} even when your system prompt names another model:`,
+    'that name is the session setting the router overrides, not a sign the router is broken.',
+    'Changing the model or effort in the session has no effect;',
     'to change the effort, the user types #trivial, #simple, #standard, #hard or #max in a message.',
   ].join(' ')
 }

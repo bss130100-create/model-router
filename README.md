@@ -26,12 +26,12 @@ line fails setup loudly if the wrong version got installed.
 
 ```
 set -e
-claude plugin marketplace add bss130100-create/model-router#release-0.5.0
+claude plugin marketplace add bss130100-create/model-router#release-0.5.1
 claude plugin install model-router@mihai-mods
-claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.5.0" || { echo "model-router: installed version is not 0.5.0" >&2; exit 1; }
+claude plugin list | grep -A1 "model-router@mihai-mods" | grep -q "Version: 0.5.1" || { echo "model-router: installed version is not 0.5.1" >&2; exit 1; }
 ```
 
-To update: push a `release-<version>` branch, then change both `0.5.0`s in the script.
+To update: push a `release-<version>` branch, then change every `0.5.1` in the script.
 
 ## What it does
 
@@ -68,35 +68,45 @@ runs on Opus at low effort.
 replies "The router recommends max for this. Reply yes to run it at max, or no
 to run it at hard." That asking turn runs at low effort. Your next message decides:
 
-- A message that starts with `yes` (or y, yeah, yep, yup, ok, okay, sure, proceed) runs the held request at max.
+- A short message (10 words or fewer) that starts with `yes` (or y, yeah, yep, yup, ok, okay, sure, proceed) runs the held request at max.
 - A message made only of `go`, `do it`, `go ahead` or `go for it` is a yes too.
-- A message that starts with `no` (or n, nope, nah) runs it at hard.
+- A short message that starts with `no` (or n, nope, nah) runs it at hard.
 - Anything else is a new request: it is classified as usual and the held one is dropped.
-  That includes a message holding both ("ok wait, no") and "do it at hard instead".
+  That includes a message holding both ("ok wait, no"), a question ("ok, what is 2+2?"),
+  a hedge ("sure, but...", "ok wait, ..."), a long message, and "do it at hard instead".
 
 So "no, and also check the logs" is a no, and "yes, and check the logs too" is a yes.
-A background task finishing in between does not cancel the question.
+A background task finishing, or a colleague's note, in between does not cancel the question.
 
 Type `#trivial`, `#simple`, `#standard`, `#hard` or `#max` anywhere in a prompt
-to force a tier. A tag skips the classifier. Only tags in your own words count: a
+to force a tier. Only a tag of its own counts: `#max-width` in pasted CSS or
+`page.html#simple` in a link does not. A tag skips the classifier. Only tags in your own words count: a
 `#max` (or a yes) that Claude wrote, or that a colleague's note quotes, does not.
 
-**Turns you did not start** (a background task finishing, a system event, a
-slash command) carry your last pick, but never max: max runs only for the
-request you said yes to (or tagged #max).
+**Turns you did not start** (a background task finishing, a PR event, a
+scheduled wake, a system event, a slash command) carry your last pick, kept
+between `standard` (`CARRY_FLOOR`) and `hard`: such a turn usually does real
+work, even after a "thanks" picked trivial, and max runs only for the request
+you said yes to (or tagged #max). With no pick yet (a new session, or after the
+cloud container's idle restart) they run at standard, still on Opus. A `#max`
+or yes typed while a turn is running runs at max on the next turn.
 
 **Projects threads.** Messages there arrive wrapped in XML; the router reads only
 your words (plus a colleague's note) and Claude's replies (sent through its reply
 tool), and drops rows that are only tool calls before taking the last 6 messages
-as context. Background-task notifications and system
-events (a wake with no words from you and no note) carry the last pick instead of
-being routed again. A message that arrives while a turn runs is routed for the
+as context. A coordinator's relay is routed like your own message. Background-task
+notifications and system events (a wake with no words from you and no note) carry
+the last pick instead of being routed again. A thread's first turn starts with
+several rows queued at once (the relay with your message, then system wakes) and
+the turn's own prompt is the last, wordless one; the router then routes the turn
+on the words in that batch. A message that arrives while a turn runs is routed for the
 next turn; the running turn keeps its route.
 
 ## Tuning it
 
 Everything lives in `hooks/rules.ts`: the one `MODEL`, each tier's effort and the
-plain English guide the classifier reads to recognise it, plus `AUTO_TIER_CAP`.
+plain English guide the classifier reads to recognise it, plus `AUTO_TIER_CAP`
+and `CARRY_FLOOR`.
 Change a guide to move a kind of request up or down a tier.
 
 If the classifier fails (timeout, API error, or an answer that is not exactly one
@@ -111,6 +121,12 @@ the mod from loading, and Claude Code shows the reason.
 Ask Claude "which route are you on?". The router adds a one-line hidden note to
 each prompt telling Claude the model, effort and tier it picked, so this works
 everywhere, including Projects threads where slash commands cannot run.
+
+Quirk: the system prompt still names the session's model (for example Sonnet)
+even though the turn runs on Opus. The note tells Claude that name is the
+setting the router overrides, so it should not report the router as broken.
+The session transcript (`~/.claude/projects/<cwd>/<session>.jsonl`) is the
+proof: each assistant row records the `effort` and `message.model` that ran.
 
 ## Commands (terminal and desktop Code sessions)
 

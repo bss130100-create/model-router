@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { AUTO_TIER_CAP, CLASSIFIER, MODEL, ON_CLASSIFIER_ERROR, TIERS } from '../hooks/rules'
+import { AUTO_TIER_CAP, CARRY_FLOOR, CLASSIFIER, MODEL, ON_CLASSIFIER_ERROR, TIERS } from '../hooks/rules'
 import {
   answerHeld,
+  batchStart,
   buildClassifierRequest,
   capAutoTier,
   carryPick,
@@ -18,6 +19,7 @@ import {
   readAnswer,
   routeNote,
   rowText,
+  unroutedBatch,
   unwrap,
   validateConfig,
 } from '../hooks/route'
@@ -31,6 +33,16 @@ describe('findTag', () => {
   })
   test('ignores hashtags that are not tiers', async () => {
     expect(findTag('see issue #12 and #todo')).toBe(null)
+  })
+  test('ignores a tier name inside pasted code, a URL or a longer name', async () => {
+    expect(findTag('.box { #max-width: 10px }')).toBe(null)
+    expect(findTag('open page.html#simple then docs/#hard')).toBe(null)
+    expect(findTag('color: #maxed; a##max')).toBe(null)
+  })
+  test('a tag at a word start still counts, next to punctuation', async () => {
+    expect(findTag('(#max) please')).toBe('max')
+    expect(findTag('go deep #hard.')).toBe('hard')
+    expect(findTag('#simple: what is a venv?')).toBe('simple')
   })
 })
 
@@ -85,29 +97,29 @@ describe('buildClassifierRequest', () => {
 
 describe('validateConfig', () => {
   test('the shipped rules are valid', async () => {
-    validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)
+    validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP, CARRY_FLOOR)
   })
   test('an unknown effort is refused', async () => {
     const bad = { ...TIERS, hard: { ...TIERS.hard, effort: 'ultra' as never } }
-    expect(() => validateConfig(bad, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(/effort "ultra"/)
+    expect(() => validateConfig(bad, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP, CARRY_FLOOR)).toThrow(/effort "ultra"/)
   })
   test('a missing tier is refused', async () => {
     const { max: _, ...rest } = TIERS
-    expect(() => validateConfig(rest as typeof TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(
+    expect(() => validateConfig(rest as typeof TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP, CARRY_FLOOR)).toThrow(
       /missing "max"/,
     )
   })
   test('an empty guide is refused', async () => {
     const bad = { ...TIERS, simple: { ...TIERS.simple, guide: ' ' } }
-    expect(() => validateConfig(bad, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(/empty guide/)
+    expect(() => validateConfig(bad, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP, CARRY_FLOOR)).toThrow(/empty guide/)
   })
   test('a bad timeout is refused', async () => {
-    expect(() => validateConfig(TIERS, MODEL, { ...CLASSIFIER, timeoutMs: 0 }, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(
+    expect(() => validateConfig(TIERS, MODEL, { ...CLASSIFIER, timeoutMs: 0 }, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP, CARRY_FLOOR)).toThrow(
       /timeoutMs/,
     )
   })
   test('an error tier that does not exist is refused', async () => {
-    expect(() => validateConfig(TIERS, MODEL, CLASSIFIER, 'medium' as never, AUTO_TIER_CAP)).toThrow(/not a tier/)
+    expect(() => validateConfig(TIERS, MODEL, CLASSIFIER, 'medium' as never, AUTO_TIER_CAP, CARRY_FLOOR)).toThrow(/not a tier/)
   })
 })
 
@@ -205,21 +217,85 @@ describe('decide', () => {
 })
 
 describe('carryPick', () => {
-  test('a pick at or below the cap carries as it is', async () => {
-    const hard = decide('hard', 'classifier', 'bug', TIERS)
-    expect(carryPick(hard, 'hard', TIERS)).toBe(hard)
+  const ran = (d: ReturnType<typeof decide>) => ({ ...d, ran: true })
+
+  test('a pick between the floor and the cap carries as it is', async () => {
+    const hard = ran(decide('hard', 'classifier', 'bug', TIERS))
+    expect(carryPick(hard, 'standard', 'hard', TIERS)).toBe(hard)
   })
 
-  test('max never carries: it drops to the cap', async () => {
-    const carried = carryPick(decide('max', 'tag', '#max tag', TIERS), 'hard', TIERS)
+  test('max that has run never carries: it drops to the cap', async () => {
+    const carried = carryPick(ran(decide('max', 'tag', '#max tag', TIERS)), 'standard', 'hard', TIERS)
     expect(carried.tier).toBe('hard')
     expect(carried.effort).toBe('xhigh')
     expect(carried.recommended).toBe(null)
   })
+
+  test('a low pick ("thanks") rises to the floor', async () => {
+    const carried = carryPick(ran(decide('trivial', 'classifier', 'thanks', TIERS)), 'standard', 'hard', TIERS)
+    expect(carried.tier).toBe('standard')
+    expect(carried.effort).toBe('high')
+  })
+
+  test('a held question carries at the floor, without the recommendation', async () => {
+    const held = { ...holdForAnswer(capAutoTier(decide('max', 'classifier', 'stuck', TIERS), 'hard', TIERS), TIERS), ran: true }
+    const carried = carryPick(held, 'standard', 'hard', TIERS)
+    expect(carried.tier).toBe('standard')
+    expect(carried.recommended).toBe(null)
+  })
+
+  test('a #max no turn has run yet carries whole, for the next turn', async () => {
+    const max = decide('max', 'tag', '#max tag', TIERS)
+    expect(carryPick(max, 'standard', 'hard', TIERS)).toBe(max)
+  })
+
+  test('no pick yet (a new session, or after a restart) runs at the floor', async () => {
+    const carried = carryPick(null, 'standard', 'hard', TIERS)
+    expect(carried).toMatchObject({ tier: 'standard', model: MODEL, effort: 'high', source: 'carry' })
+  })
+})
+
+describe('unroutedBatch', () => {
+  const relay =
+    '<coordinator-relay><relay from="coordinator"><cited author="user" name="Mihai">I want you to fix all the issues.</cited><note>Brief in the project files.</note></relay></coordinator-relay>'
+  const activity = '<system-reminder>[SYSTEM NOTIFICATION]<wake reason="project-activity"><message from="agent">Fix it</message></wake></system-reminder>'
+  const before = [
+    { role: 'user' as const, text: 'earlier request' },
+    { role: 'assistant' as const, text: 'done' },
+  ]
+
+  test("a thread's start-up batch with nothing routed gives the person's words and the note", async () => {
+    const rows = [...before, { role: 'user' as const, text: relay }, { role: 'user' as const, text: activity }]
+    expect(batchStart(rows)).toBe(2)
+    expect(unroutedBatch(rows, -1)).toBe(relay)
+    expect(extractRequest(unroutedBatch(rows, -1))).toBe(
+      'I want you to fix all the issues.\n(note from a colleague: Brief in the project files.)',
+    )
+  })
+
+  test('a batch already routed (a pick made at or after its start) gives nothing', async () => {
+    const rows = [...before, { role: 'user' as const, text: relay }]
+    expect(unroutedBatch(rows, 2)).toBe('')
+    expect(unroutedBatch(rows, 3)).toBe('')
+  })
+
+  test('words before Claude\'s last reply, plain rows and notifications are not the batch', async () => {
+    const rows = [
+      { role: 'user' as const, text: relay },
+      { role: 'assistant' as const, text: '' },
+      { role: 'user' as const, text: 'plain text from a hook' },
+      { role: 'user' as const, text: '<task-notification><status>completed</status></task-notification>' },
+    ]
+    expect(unroutedBatch(rows, -1)).toBe('')
+  })
+})
+
+test('a CARRY_FLOOR above AUTO_TIER_CAP is refused', async () => {
+  expect(() => validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, 'simple', 'standard')).toThrow(/CARRY_FLOOR/)
 })
 
 test('an empty MODEL is refused', async () => {
-  expect(() => validateConfig(TIERS, ' ', CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)).toThrow(/MODEL is empty/)
+  expect(() => validateConfig(TIERS, ' ', CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP, CARRY_FLOOR)).toThrow(/MODEL is empty/)
 })
 
 describe('prepareClassifierInput', () => {
@@ -287,6 +363,7 @@ describe('capAutoTier', () => {
       model: 'opus',
       effort: 'xhigh',
       recommended: 'max',
+      ran: false,
     })
   })
 })
@@ -306,6 +383,7 @@ describe('holdForAnswer', () => {
       model: 'opus',
       effort: 'low',
       recommended: 'max',
+      ran: false,
     })
   })
 })
@@ -332,6 +410,12 @@ describe('readAnswer', () => {
   test('a message that holds both is not an answer', async () => {
     expect(readAnswer('ok wait, no')).toBe(null)
     expect(readAnswer('no wait, yes')).toBe(null)
+  })
+  test('a yes or no that opens something new is not an answer', async () => {
+    expect(readAnswer('ok wait, different question first: what is 2+2?')).toBe(null)
+    expect(readAnswer('Sure, but I do not know')).toBe(null)
+    expect(readAnswer('ok, what does max cost?')).toBe(null)
+    expect(readAnswer('yes and also rewrite the whole scanner, the HUD and the export in one go')).toBe(null)
   })
   test('anything else is not an answer', async () => {
     expect(readAnswer('nothing works still')).toBe(null)
@@ -381,6 +465,16 @@ describe('findHeldQuestion', () => {
     expect(findHeldQuestion(rows)).toEqual({ recommended: 'max', cap: 'hard' })
   })
 
+  test("a colleague's note after the question does not hide it", async () => {
+    const rows = [
+      { role: 'user' as const, text: 'stuck on the freeze' },
+      { role: 'assistant' as const, text: ask },
+      { role: 'user' as const, text: '<relay from="coordinator"><note>Mihai is away for an hour.</note></relay>' },
+      { role: 'assistant' as const, text: 'Noted.' },
+    ]
+    expect(findHeldQuestion(rows)).toEqual({ recommended: 'max', cap: 'hard' })
+  })
+
   test('null when the line names no real tier', async () => {
     const rows = [{ role: 'assistant' as const, text: heldQuestion('huge' as never, 'hard') }]
     expect(findHeldQuestion(rows)).toBe(null)
@@ -396,6 +490,7 @@ describe('answerHeld', () => {
       model: 'opus',
       effort: 'max',
       recommended: null,
+      ran: false,
     })
   })
   test('no runs the cap', async () => {
@@ -449,7 +544,7 @@ describe('routeNote', () => {
 })
 
 test('an AUTO_TIER_CAP that is not a tier is refused', async () => {
-  expect(() => validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, 'huge' as never)).toThrow(
+  expect(() => validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, 'huge' as never, CARRY_FLOOR)).toThrow(
     /AUTO_TIER_CAP/,
   )
 })

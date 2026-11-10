@@ -58,13 +58,15 @@ def verdict(tier, case, recommended=None):
 
 
 def score(cases, results):
-    failed = [r for r in results if not r['ok']]
-    if failed:
-        raise RuntimeError(f'{len(failed)} classifier calls failed, first: {failed[0]}')
     by_case = {c['id']: c for c in cases}
     tally = {m: collections.Counter() for m in FLOORS}
     misses = []
     for r in sorted(results, key=lambda r: (r['mode'], r['id'], r['run'])):
+        if not r['ok']:
+            # The harness already retried once; a call that still failed is a miss, not the end of the eval.
+            tally[r['mode']]['failed'] += 1
+            misses.append(f"{r['mode']:7} {r['id']:6} {'(no answer)':13} (failed after a retry): {r.get('error')}")
+            continue
         # Scored on the tier that runs; a needless recommendation is scored as a stall.
         v = verdict(r['tier'], by_case[r['id']], r.get('recommended'))
         tally[r['mode']][v] += 1
@@ -91,11 +93,12 @@ def main():
     print('\n'.join(misses) or 'no misses')
     passed = True
     for mode, t in tally.items():
-        total = t['ok'] + t['over'] + t['under'] + t['stall']
+        total = t['ok'] + t['over'] + t['under'] + t['stall'] + t['failed']
         rate = t['ok'] / total
         passed &= rate >= FLOORS[mode]
         print(f"{mode:7} {t['ok']}/{total} in range ({rate:.0%}, floor {FLOORS[mode]:.0%}), too high {t['over']}, "
-              f"too low {t['under']}, needless max stalls {t['stall']}, max recommended {t['recommended']}")
+              f"too low {t['under']}, needless max stalls {t['stall']}, failed calls {t['failed']}, "
+              f"max recommended {t['recommended']}")
     sys.exit(0 if passed else 1)
 
 

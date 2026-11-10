@@ -2,9 +2,10 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, TurnStepInput } from 'claude-code'
 
 import type { ModelRouterDecision, ModelRouterTurnLock } from '../types'
-import { AUTO_TIER_CAP, CLASSIFIER, MODEL, ON_CLASSIFIER_ERROR, TIERS } from './rules'
+import { AUTO_TIER_CAP, CARRY_FLOOR, CLASSIFIER, MODEL, ON_CLASSIFIER_ERROR, TIERS } from './rules'
 import {
   answerHeld,
+  batchStart,
   buildClassifierRequest,
   capAutoTier,
   carryPick,
@@ -14,11 +15,13 @@ import {
   findHeldQuestion,
   findTag,
   holdForAnswer,
+  isWrapped,
   label,
   parseClassifierReply,
   prepareClassifierInput,
   readAnswer,
   routeNote,
+  unroutedBatch,
   unwrap,
   validateConfig,
 } from './route'
@@ -27,11 +30,13 @@ import type { SessionRow } from './route'
 // Change a shape tag when that value's fields change: it declines what an
 // earlier version stored, which outlives a reload.
 const last = atom({ plugin: 'model-router', key: 'last' } as const, null as ModelRouterDecision | null, {
-  shape: 'decision-6',
+  shape: 'decision-7',
 })
 const lock = atom({ plugin: 'model-router', key: 'lock' } as const, null as ModelRouterTurnLock | null, {
-  shape: 'lock-6',
+  shape: 'lock-7',
 })
+// The transcript's row count when `last` was picked, so a start-up batch is routed once.
+const routedAt = atom({ plugin: 'model-router', key: 'routedAt' } as const, -1)
 const isOff = atom({ plugin: 'model-router', key: 'isOff' } as const, false)
 
 /** Asks the classifier model which tier the prompt needs. */
@@ -72,13 +77,12 @@ async function pick($: EngineInterface, text: string, rows: readonly SessionRow[
  * quoted in a note, must not. A #tag wins, then a yes or no to the question
  * Claude last asked (read from the transcript), then the classifier.
  */
-async function choose($: EngineInterface, text: string): Promise<ModelRouterDecision> {
+async function choose($: EngineInterface, text: string, rows: readonly SessionRow[]): Promise<ModelRouterDecision> {
   const words = unwrap(text).words
   const tag = findTag(words)
   if (tag !== null) {
     return decide(tag, 'tag', `#${tag} tag`, TIERS)
   }
-  const rows = await $.session.messages()
   const answer = readAnswer(words)
   const held = answer === null ? null : findHeldQuestion(rows)
   if (answer !== null && held !== null) {
@@ -87,12 +91,11 @@ async function choose($: EngineInterface, text: string): Promise<ModelRouterDeci
   return pick($, text, rows)
 }
 
-/** The route a turn the person did not start carries: their last pick, never above AUTO_TIER_CAP. */
+/** The route a turn the person did not start carries: their last pick, between CARRY_FLOOR and AUTO_TIER_CAP. */
 async function carry($: EngineInterface): Promise<void> {
-  const carried = await update($, last, d => (d === null ? null : carryPick(d, AUTO_TIER_CAP, TIERS)))
-  if (carried !== null) {
-    $.ui.status(label(carried))
-  }
+  const carried = carryPick(await read($, last), CARRY_FLOOR, AUTO_TIER_CAP, TIERS)
+  await update($, last, () => carried)
+  $.ui.status(label(carried))
 }
 
 /** The declared error tier, said out loud: never a silent fallback. */
@@ -114,13 +117,14 @@ async function routeStep($: EngineInterface, e: TurnStepInput): Promise<TurnStep
     }
     locked = { turnId: e.turnId, decision }
     await update($, lock, () => locked)
+    await update($, last, d => (d === null ? null : { ...d, ran: true }))
   }
   return { ...e, model: locked.decision.model, effort: locked.decision.effort }
 }
 
 export const register: Register = on => {
   // Fail fast: a broken rules.ts stops the mod from loading, with the reason.
-  validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP)
+  validateConfig(TIERS, MODEL, CLASSIFIER, ON_CLASSIFIER_ERROR, AUTO_TIER_CAP, CARRY_FLOOR)
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -132,19 +136,30 @@ export const register: Register = on => {
 
   // 1. Understand each prompt you send and pick a tier.
   // Slash commands, background-task notifications and system events (a
-  // wrapped prompt with neither the person's words nor a note) carry the last pick.
+  // wrapped prompt with neither the person's words nor a note) carry the last
+  // pick, unless the turn's start-up batch holds words no prompt routed.
+  // A Projects relay comes as a task notification, so a notification counts
+  // when it is a wake or relay with words in it.
   on('prompt.submit', async ($, e, next) => {
     if (await read($, isOff)) {
       return next(e)
     }
-    const isYours =
-      e.command === undefined && e.origin.kind !== 'task-notification' && extractRequest(e.text).trim() !== ''
-    if (!isYours) {
+    if (e.command !== undefined) {
       await carry($)
       return next(e)
     }
-    const decision = await choose($, e.text)
+    const rows = await $.session.messages()
+    const isYours =
+      (e.origin.kind !== 'task-notification' || isWrapped(e.text)) && extractRequest(e.text).trim() !== ''
+    const text = isYours ? e.text : unroutedBatch(rows, await read($, routedAt))
+    if (text === '') {
+      await carry($)
+      return next(e)
+    }
+    // A batch's words are not in the rows the classifier reads as earlier context.
+    const decision = await choose($, text, isYours ? rows : rows.slice(0, batchStart(rows)))
     await update($, last, () => decision)
+    await update($, routedAt, () => rows.length)
     $.ui.status(label(decision))
     // Tell the answering model its route, so in any session (Projects threads
     // included, where /route cannot run) you can ask "which route are you on?".
@@ -173,6 +188,7 @@ export const register: Register = on => {
       await update($, isOff, () => arg === 'off')
       await update($, last, () => null)
       await update($, lock, () => null)
+      await update($, routedAt, () => -1)
       $.ui.status(arg === 'off' ? 'route: off' : undefined)
       return { text: `Model router is now ${arg.toUpperCase()}.` }
     }

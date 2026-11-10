@@ -42,9 +42,15 @@ class EvalTest(unittest.TestCase):
         case = dict(CASES[1], ok=['hard', 'max'])
         self.assertEqual(ev.verdict('hard', case, 'max'), 'ok')
 
-    def test_failed_call_stops_the_eval(self):
-        with self.assertRaises(RuntimeError):
-            ev.score(CASES, [{'id': 'X1', 'mode': 'context', 'run': 1, 'ok': False, 'error': 'timeout'}])
+    def test_a_failed_call_is_a_miss_not_a_crash(self):
+        results = [{'id': 'X1', 'mode': 'context', 'run': 1, 'ok': False, 'error': 'timeout'},
+                   {'id': 'X1', 'mode': 'context', 'run': 2, 'ok': True, 'classified': 'trivial', 'tier': 'trivial',
+                    'recommended': None, 'why': 'a'}]
+        tally, misses = ev.score(CASES, results)
+        self.assertEqual(tally['context']['failed'], 1)
+        self.assertEqual(tally['context']['ok'], 1)
+        self.assertEqual(len(misses), 1)
+        self.assertIn('timeout', misses[0])
 
     def test_sample_cases_file_is_consistent(self):
         cases = json.load(open(os.path.join(ev.HERE, 'sample-cases.json')))

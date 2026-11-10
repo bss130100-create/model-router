@@ -20,18 +20,21 @@ export type ModelRouterClassifier = {
 
 /**
  * What the router picked for a prompt and why. `source` says who picked the
- * tier: a #tag you typed, the classifier, the declared error tier, or your
- * yes or no to a recommendation.
+ * tier: a #tag you typed, the classifier, the declared error tier, your
+ * yes or no to a recommendation, or `carry` (a turn you did not start, with
+ * no pick of yours to carry).
  */
 export type ModelRouterDecision = ModelRouterRoute & {
   tier: ModelRouterTier
-  source: 'tag' | 'classifier' | 'error' | 'answer'
+  source: 'tag' | 'classifier' | 'error' | 'answer' | 'carry'
   why: string
   /**
    * A higher tier the router recommends. While set, the work waits: the turn
    * only asks you, and your yes or no on the next message decides the route.
    */
   recommended: ModelRouterTier | null
+  /** Whether a turn has run on this pick yet; one typed mid-turn has not, and carries whole to the next turn. */
+  ran: boolean
 }
 
 /** The route locked in for one turn, so a turn never changes model halfway. */
@@ -42,6 +45,7 @@ declare module 'claude-code' {
     'model-router': {
       last: Shaped<ModelRouterDecision | null>
       lock: Shaped<ModelRouterTurnLock | null>
+      routedAt: number
       isOff: boolean
     }
   }

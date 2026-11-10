@@ -31,7 +31,7 @@ scored as a miss (a "needless max stall"), whatever tier would run after. It exi
 A label may change only for a reason that doesn't depend on what the classifier picked, and the case
 then carries a `label_note` saying why.
 
-Results (0.4.1 and 0.5.0 on 27 Oct 2026):
+Results (0.4.1 and 0.5.0 on 27 Oct 2026, 0.5.1 on 10 Nov 2026):
 
 | version | runs | context | thread | max recommended |
 | --- | --- | --- | --- | --- |
@@ -39,5 +39,10 @@ Results (0.4.1 and 0.5.0 on 27 Oct 2026):
 | 0.3.0 | 5 | 164/165 | 120/120 | 5 |
 | 0.4.1 | 5 | 165/165 | 109/120 (4 too high, 7 needless max stalls) | 7 |
 | 0.5.0 | 5 | 163/165 (2 too high) | 118/120 (2 too high), 0 stalls | 0 |
+| 0.5.0 rerun, 10 Nov | 5 | 160/165 (5 too high) | 111/120 (8 too high, 1 stall) | 1 |
+| 0.5.1 | 5 | 156/165 (9 too high) | 113/120 (7 too high), 0 stalls | 0 |
 
 0.2.1's thread runs had no context, since that version saw none in a thread.
+0.5.1 sends the classifier byte-for-byte the same requests as 0.5.0 (checked over every case), so the
+drop is run-to-run noise of the classifier model: every miss is too high (T1-7, T2-4), none too low.
+A call that still fails after one retry is now counted as a miss; 0.5.0's eval stopped on it.

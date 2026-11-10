@@ -211,7 +211,7 @@ test('the answering model is told its route', async ($, on) => {
   const { notes } = engine(on, '{"tier":"hard","why":"intermittent crash"}')
   await say($, 'the scan sometimes freezes')
   expect(notes[0]).toBe(
-    '[model-router] This turn runs on opus at xhigh effort (tier hard, picked by classifier: intermittent crash). Mention it only if the user asks which model, effort or route is in use. The router sets the model and effort of every turn, so changing them in the session has no effect: to change the effort, the user types #trivial, #simple, #standard, #hard or #max in a message.',
+    '[model-router] This turn runs on opus at xhigh effort (tier hard, picked by classifier: intermittent crash). Mention it only if the user asks which model, effort or route is in use. The router sets the model and effort of every turn, so this turn runs on opus even when your system prompt names another model: that name is the session setting the router overrides, not a sign the router is broken. Changing the model or effort in the session has no effect; to change the effort, the user types #trivial, #simple, #standard, #hard or #max in a message.',
   )
 })
 
@@ -425,4 +425,114 @@ test('a message that arrives mid-turn is told it applies from the next turn', as
   const { notes } = engine(on, '{"tier":"simple","why":"q"}')
   await $.prompt.submit({ text: 'and the logs?', wait: false, origin: { kind: 'composer' }, turnId: 't1' })
   expect(notes[0]).toContain('The turn already running keeps its route')
+})
+
+// A Projects thread's start: the coordinator's relay (the person's message
+// and a note) and a project-activity wake are queued as transcript rows, and
+// the turn's own prompt is the last row, a system wake with no words.
+const START_RELAY =
+  '<coordinator-relay><relay from="coordinator"><cited author="user" name="Mihai">I want you to fix all the issues.</cited><note>Brief in the project files.</note></relay></coordinator-relay>'
+const START_ACTIVITY =
+  '<system-reminder>[SYSTEM NOTIFICATION]<wake reason="project-activity"><message from="agent">Fix it</message></wake></system-reminder>'
+const START_WAKE = '<wake reason="thread-computer-status"><system-note>status=not_linked</system-note></wake>'
+
+test("a thread's first turn is routed on the person's words in its start-up batch", async ($, on) => {
+  const { sent, asked, notes, rows } = engine(on, '{"tier":"hard","why":"many fixes"}')
+  rows.push({ role: 'user', text: START_RELAY }, { role: 'user', text: START_ACTIVITY })
+  await say($, START_WAKE)
+  await step($, 't1', 0)
+  expect(asked.length).toBe(1)
+  expect(String(asked[0]?.prompt)).toContain('<new_request>\nI want you to fix all the issues.\n(note from a colleague: Brief in the project files.)\n</new_request>')
+  // The batch is the request, not earlier context.
+  expect(String(asked[0]?.prompt)).not.toContain('USER: I want you')
+  expect(notes[0]).toContain('This turn runs on opus at xhigh effort')
+  expect(sent[0]?.effort).toBe('xhigh')
+})
+
+test('a start-up batch already routed by its own relay is not classified twice', async ($, on) => {
+  const { sent, asked, rows } = engine(on, '{"tier":"hard","why":"many fixes"}')
+  rows.push({ role: 'user', text: START_RELAY })
+  await notify($, START_RELAY)
+  await say($, START_WAKE)
+  await step($, 't1', 0)
+  expect(asked.length).toBe(1)
+  expect(sent[0]?.effort).toBe('xhigh')
+})
+
+test("a coordinator's relay is routed, though the engine marks it a task notification", async ($, on) => {
+  const { sent, asked } = engine(on, '{"tier":"simple","why":"q"}')
+  await notify($, START_RELAY)
+  await step($, 't1', 0)
+  expect(asked.length).toBe(1)
+  expect(sent[0]?.effort).toBe('medium')
+})
+
+test('a turn you did not start runs at least at standard, even after "thanks"', async ($, on) => {
+  const { sent } = engine(on, '{"tier":"trivial","why":"thanks"}')
+  await say($, 'thanks!')
+  await step($, 't1', 0)
+  await notify($, '<task-notification><status>completed</status></task-notification>')
+  await step($, 't2', 0)
+  expect(sent.map(s => s.effort)).toEqual(['low', 'high'])
+})
+
+test('after a held max question, a turn you did not start runs at standard', async ($, on) => {
+  const { sent } = engine(on, STUCK)
+  await say($, 'we tried 4 fixes and it still fails')
+  await step($, 't1', 0)
+  await say($, '<wake reason="github"><system-note>CI failed on the PR.</system-note></wake>')
+  await step($, 't2', 0)
+  expect(sent.map(s => s.effort)).toEqual(['low', 'high'])
+})
+
+test('with no pick (after a restart), a turn you did not start runs on opus at standard', async ($, on) => {
+  const { sent, asked } = engine(on)
+  await notify($, '<task-notification><status>completed</status></task-notification>')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(0)
+  expect(sent[0]?.model).toBe('opus')
+  expect(sent[0]?.effort).toBe('high')
+})
+
+test('a #max typed while a turn runs runs at max on the next turn, then drops to the cap', async ($, on) => {
+  const { sent } = engine(on, '{"tier":"simple","why":"q"}')
+  await say($, 'what is this?')
+  await step($, 't1', 0)
+  await $.prompt.submit({ text: 'dig deeper #max', wait: false, origin: { kind: 'composer' }, turnId: 't1' })
+  await step($, 't1', 1)
+  await notify($, '<task-notification><status>completed</status></task-notification>')
+  await step($, 't2', 0)
+  await notify($, '<task-notification><status>completed</status></task-notification>')
+  await step($, 't3', 0)
+  expect(sent.map(s => s.effort)).toEqual(['medium', 'medium', 'max', 'xhigh'])
+})
+
+test('"ok wait, ..." with a new question is not a yes to the max question', async ($, on) => {
+  const { sent, asked, rows } = engine(on, '{"tier":"trivial","why":"arithmetic"}')
+  asked_max(rows)
+  await say($, 'ok wait, different question first: what is 2+2?')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(1)
+  expect(sent[0]?.effort).toBe('low')
+})
+
+test("a colleague's note between the question and the answer does not hide it", async ($, on) => {
+  const { sent, asked, rows } = engine(on)
+  asked_max(rows)
+  rows.push(
+    { role: 'user', text: '<relay from="coordinator"><note>Mihai is away for an hour.</note></relay>' },
+    { role: 'assistant', text: 'Noted.' },
+  )
+  await say($, 'yes')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(0)
+  expect(sent[0]?.effort).toBe('max')
+})
+
+test('#max-width in pasted CSS does not force max', async ($, on) => {
+  const { sent, asked } = engine(on, '{"tier":"simple","why":"css"}')
+  await say($, 'why is this wrong? .box { #max-width: 10px }')
+  await step($, 't1', 0)
+  expect(asked.length).toBe(1)
+  expect(sent[0]?.effort).toBe('medium')
 })

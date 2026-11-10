@@ -12,15 +12,19 @@ async function classify($: EngineInterface, job: Job) {
   const input = prepareClassifierInput(job.prompt, job.rows, CLASSIFIER.contextMessages)
   const ask = buildClassifierRequest(input.prompt, input.context, TIERS)
   const started = Date.now()
-  const reply = await $.model.complete({
-    model: CLASSIFIER.model,
-    effort: CLASSIFIER.effort,
-    timeoutMs: CLASSIFIER.timeoutMs,
-    maxTokens: 100,
-    system: ask.system,
-    prompt: ask.prompt,
-  })
-  const base = { id: job.id, mode: job.mode, run: job.run, ms: Date.now() - started, usage: reply.usage }
+  const call = () =>
+    $.model.complete({
+      model: CLASSIFIER.model,
+      effort: CLASSIFIER.effort,
+      timeoutMs: CLASSIFIER.timeoutMs,
+      maxTokens: 100,
+      system: ask.system,
+      prompt: ask.prompt,
+    })
+  // One retry for a call that got no answer (a timeout, an overloaded API); a second failure is scored as a miss.
+  const first = await call()
+  const reply = first.isAnswered ? first : await call()
+  const base = { id: job.id, mode: job.mode, run: job.run, ms: Date.now() - started, usage: reply.usage, retried: !first.isAnswered }
   if (!reply.isAnswered) {
     return { ...base, ok: false, error: reply.reason }
   }

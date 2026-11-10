@@ -70,3 +70,8 @@ export const AUTO_TIER_CAP: ModelRouterTier = 'hard'
 // used, and the status line and Claude's reply say so. Your prompt is never
 // blocked by the router.
 export const ON_CLASSIFIER_ERROR: ModelRouterTier = 'standard'
+
+// A turn you did not start (a background task finishing, a PR event, a
+// scheduled wake) usually does real work, so it runs at least at this tier,
+// even after a "thanks" picked trivial, and at most at AUTO_TIER_CAP.
+export const CARRY_FLOOR: ModelRouterTier = 'standard'
